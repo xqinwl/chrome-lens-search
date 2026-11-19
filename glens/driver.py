@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
+import subprocess
 from pathlib import Path
 
 logger = logging.getLogger("glens")
@@ -53,6 +55,36 @@ def build_driver(*, headless: bool | None = None, user_data_dir: str | os.PathLi
             "The browser backend needs undetected-chromedriver. "
             "Install it with:  pip install 'chrome-lens-search[browser]'"
         ) from exc
+
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        if not getattr(uc.Patcher, "_glens_arm64", False):
+            class Arm64Patcher(uc.Patcher):
+                _glens_arm64 = True
+
+                def _set_platform_name(self):
+                    super()._set_platform_name()
+                    if not self.is_old_chromedriver:
+                        self.platform_name = "mac-arm64"
+
+                def patch(self):
+                    patched = super().patch()
+                    subprocess.run(
+                        [
+                            "/usr/bin/codesign",
+                            "--force",
+                            "--sign",
+                            "-",
+                            "--timestamp=none",
+                            self.executable_path,
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    return patched
+
+            uc.Patcher = Arm64Patcher
 
     if headless is None:
         headless = _env_flag("GLENS_HEADLESS", True)

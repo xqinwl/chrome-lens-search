@@ -60,6 +60,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="emit JSON instead of pretty text")
     parser.add_argument("--raw", action="store_true",
                         help="include every harvested anchor in the JSON output")
+    parser.add_argument("--resolve-links", action="store_true",
+                        help="resolve Google redirect wrappers to merchant URLs "
+                             "(slower; may be rate limited)")
     parser.add_argument("--max-matches", type=int, default=None, metavar="N",
                         help="cap on external merchant links returned")
     parser.add_argument("--max-titles", type=int, default=None, metavar="N",
@@ -240,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
             cookie_file=args.cookie_file,
             lang=args.lang,
             use_cache=True if args.cache else None,  # None -> GLENS_CACHE default
+            resolve_links=args.resolve_links,
         )
     except ValueError as exc:
         # e.g. an invalid GLENS_BACKEND env value slipping past argparse, which

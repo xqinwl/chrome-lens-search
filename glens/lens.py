@@ -49,7 +49,6 @@ import threading
 import time
 import zlib
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -256,9 +255,9 @@ def _is_external(href: str) -> bool:
 # carries its target in the clear; ``/goto`` is what Lens result tiles use now
 # and carries an ENCRYPTED blob instead (verified live 2026-09).
 _REDIRECT_PATHS = frozenset({"/goto", "/url"})
-# Resolving a wrapper is one cheap 302 lookup each, so fan them out.
-_RESOLVE_WORKERS = 8
+# Google rate-limits wrapper lookups, so resolve selected links serially.
 _RESOLVE_TIMEOUT = 15
+_RESOLVE_INTERVAL_SECONDS = 2.0
 
 
 def _is_google_redirect(href: str) -> bool:
@@ -677,7 +676,11 @@ def _unwrap_google_redirect(href: str) -> str:
     return _redirect_target(href) or href
 
 
-def _resolve_google_redirects(items: list[dict]) -> None:
+def _resolve_google_redirects(
+    items: list[dict],
+    cookie_file: Path | None = None,
+    selected_hrefs: set[str] | None = None,
+) -> None:
     """Rewrite Google's encrypted outbound wrappers to the URLs they point at.
 
     Google used to hand out ``google.com/url?q=<merchant url>``, which unwraps
@@ -687,21 +690,29 @@ def _resolve_google_redirects(items: list[dict]) -> None:
     the wrapper answers ``302`` with the merchant URL in ``Location``. We read
     that header and stop, so the merchant's own site is never contacted.
 
-    Needs no cookies, so it serves both backends. Best-effort and in place: an
-    anchor we can't resolve keeps its wrapper URL, which still works when
-    clicked, and ``_is_external`` already counts it as a result either way.
+    Reuses the saved Google session when available, since current wrappers may
+    need its cookies and browser headers. Without a valid jar, it falls back to
+    a basic request. Best-effort and in place: an anchor we can't resolve keeps
+    its wrapper URL, which may remain usable while the Google session is active,
+    and ``_is_external`` already counts it as a result either way.
     """
     pending: dict[str, list[dict]] = {}
     for item in items:
         href = item.get("href") or ""
+        if selected_hrefs is not None and href not in selected_hrefs:
+            continue
         # Only the encrypted ones need the network; /url?q= already unwrapped.
         if _is_google_redirect(href) and not _redirect_target(href):
             pending.setdefault(href, []).append(item)
     if not pending:
         return
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": _REQ_UA_FALLBACK})
+    jar = _load_cookie_jar(cookie_file) if cookie_file else None
+    if jar:
+        session = _req_session(jar)
+    else:
+        session = requests.Session()
+        session.headers.update({"User-Agent": _REQ_UA_FALLBACK})
 
     def resolve(href: str) -> tuple[str, str]:
         try:
@@ -712,8 +723,12 @@ def _resolve_google_redirects(items: list[dict]) -> None:
             return href, ""
 
     try:
-        with ThreadPoolExecutor(max_workers=min(_RESOLVE_WORKERS, len(pending))) as pool:
-            resolved = dict(pool.map(resolve, pending))
+        resolved = {}
+        for index, href in enumerate(pending):
+            resolved_href, target = resolve(href)
+            resolved[resolved_href] = target
+            if index + 1 < len(pending):
+                time.sleep(_RESOLVE_INTERVAL_SECONDS)
     except Exception as exc:
         logger.info("glens: could not resolve Google's link wrappers (%s).", exc)
         return
@@ -1196,6 +1211,7 @@ def search(
     timeout: int | None = None,
     lang: str | None = None,
     use_cache: bool | None = None,
+    resolve_links: bool = False,
 ) -> LensResult | None:
     """Run one Google Lens pass on an image.
 
@@ -1217,6 +1233,9 @@ def search(
             ``GLENS_CACHE_DIR``). Defaults to ``GLENS_CACHE`` (off). Never
             consulted for ``backend="browser"``, since an explicit browser run
             also re-mints the cookie jar and a cache hit must not skip that.
+        resolve_links: resolve Google's temporary ``/goto`` wrappers to merchant
+            URLs. This uses the saved Google session and is slower, so it defaults
+            to False.
 
     Returns a ``LensResult`` or ``None`` when the lookup fails. Never raises for
     ordinary network/parse failures; an unknown ``backend`` raises ``ValueError``
@@ -1253,6 +1272,7 @@ def search(
 
     items: list[dict] | None = None
     results_url: str | None = None
+    cache_hit = False
     cache_key = _cache_key(frame_bytes, lang) if use_cache else None
     if cache_key and backend != "browser":
         # An explicit browser run is also how the cookie jar gets re-minted;
@@ -1260,6 +1280,7 @@ def search(
         cached = _cache_read(cache_key, DEFAULT_CACHE_TTL)
         if cached is not None:
             items, results_url = cached
+            cache_hit = True
 
     if items is None:
         with _lens_lock:
@@ -1268,15 +1289,14 @@ def search(
             if items is None and backend in ("auto", "browser"):
                 items, results_url = _search_via_browser(frame_bytes, cookie_path, timeout,
                                                          driver_factory)
-        if items:
-            # Before caching: the cache must hold real merchant URLs, never the
-            # short-lived encrypted wrappers they arrived as.
-            _resolve_google_redirects(items)
-            if cache_key:
-                _cache_write(cache_key, items, results_url)
-
     if not items:
         return None
+
+    if resolve_links:
+        selected_hrefs = {match.url for match in _to_matches(items, max_matches)}
+        _resolve_google_redirects(items, cookie_path, selected_hrefs)
+    if cache_key and (not cache_hit or resolve_links):
+        _cache_write(cache_key, items, results_url)
 
     matches = _to_matches(items, max_matches)
     titles = _to_titles(items, max_titles)
