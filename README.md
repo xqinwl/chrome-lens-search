@@ -5,6 +5,8 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+[English](README.md) | [简体中文](README_zh.md)
+
 > **Unofficial.** Not affiliated with, endorsed by, or sponsored by Google. "Google Lens" is a trademark of Google LLC. This is an independent, community-built client for research and educational use.
 
 **Unofficial Google Lens visual product search over plain HTTP.** Give it an image, get back the products Google Lens sees in it — exact product titles plus external merchant/result links. No SerpApi bill, and none of the OCR-only limitations of the free Lens libraries.
