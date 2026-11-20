@@ -188,7 +188,7 @@ Three important properties of `search()`:
 
 1. **It never raises for ordinary failures.** A missing file, a dead URL, a network blip, a parse failure — all return `None`. (The one exception: an invalid `backend=` value raises `ValueError`, because that's a bug in *your* code, not a lookup failure.)
 2. **It accepts a path, an `http(s)` URL, or raw `bytes`.**
-3. **It's synchronous and serialized** — see [§14](#14-performance--concurrency).
+3. **It's synchronous.** Independent requests can run concurrently up to the configured server limit; see [§14](#14-performance--concurrency).
 
 ---
 
@@ -540,8 +540,8 @@ If you want those, use (or wrap) `glens.driver.build_driver` — it accepts `hea
 
 - **Fast path latency:** ~2 s per lookup over plain HTTP once the jar exists (measured live). A cached hit is ~sub-second.
 - **First run / re-mint:** ~20–40 s (a full Chrome cold-start).
-- **Concurrency:** all lookups serialize through a single in-process lock (`threading.Lock`). Calling `search()` from multiple threads is safe but **not** parallel — calls queue. This is deliberate: it keeps you from hammering Google. If you need throughput, batch politely rather than fanning out.
-- **Be gentle.** This is an undocumented endpoint. One image per lookup, don't parallelize across processes to blast Google, and expect that aggressive use ages your session jar faster (rapid successive uploads can stale a jar within an hour — normal, and `auto` self-heals).
+- **Concurrency:** requests-backed lookups can overlap without an extra HTTP API concurrency limit; actual throughput depends on the worker pool and available resources. Browser fallbacks and session refreshes remain serialized. This is an undocumented endpoint with no published rate-limit contract, so increase concurrency gradually and watch for 429 responses.
+- **Be gentle.** One image per lookup. Aggressive use can trigger 403/429 responses and age the session jar faster (rapid successive uploads can stale a jar within an hour — normal, and `auto` self-heals).
 
 ---
 
@@ -565,7 +565,7 @@ logging.basicConfig(level=logging.INFO)   # everything logs to the "glens" logge
 | **`chromedriver/Chrome version mismatch; retrying pinned...`** | Harmless — glens detected undetected-chromedriver fetched a driver ahead of your Chrome and auto-retried pinned to your version. |
 | **`headless Chrome got a degraded page; retrying...with a visible Chrome window`** | Google gated the headless session; glens is re-minting with a real window. On a **headless server** this retry fails — set `GLENS_HEADLESS=1` to disable it, or run under `xvfb-run`. |
 | **`JS-gate shell served (stale/weak jar); falling back to the browser`** | Normal self-heal: the cookies aged out and the browser is re-minting. With `backend="req"` this instead returns `None` (it won't launch Chrome). |
-| **`req backend: HTTP error (403/429...)`** | Google refused the session (rate-limited or blocked). glens falls back to the browser to re-mint. If it persists, you're being too aggressive — slow down. |
+| **`req backend: HTTP error (403...)`** | Google refused the session; `auto` may fall back to the browser to re-mint. If it persists, slow down. An explicit HTTP 429 is returned as `upstream_rate_limited` without a browser retry. |
 | **`glens status` says `req_ready: false`** | No valid jar. Run `glens warmup` (needs `[browser]`). |
 | **CLI crashes with `cannot read image`** | Typo'd path or unreadable file — exit code 2, a precise error, not a backend problem. |
 | **Works locally, fails on the server** | Almost always the headless gotcha or a missing jar. See [§7](#7-deployment-recipes). |
@@ -592,7 +592,7 @@ For the curious and for contributors. This is the "why" behind the code in [`gle
 
 **Selector-light parsing.** Lens markup uses randomized, rotating CSS class names, so glens never hardcodes them. It harvests every `<a href>` plus its `aria-label`/text and mines those. This favors recall and degrades gracefully when Google reshuffles the DOM. Merchant links are often wrapped in `google.com/url?q=...` redirects, which glens unwraps.
 
-**The lock.** A module-level `threading.Lock` serializes the actual network work (both backends) so concurrent callers don't stampede Google.
+**Concurrency.** Requests-backed lookups use independent HTTP sessions and can overlap. Browser fallbacks share the configured Chrome profile and cookie jar, so a module-level lock allows only one browser session refresh at a time. The HTTP server adds no API-level concurrency ceiling; the worker pool and runtime resources bound execution.
 
 ---
 

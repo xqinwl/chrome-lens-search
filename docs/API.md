@@ -136,7 +136,7 @@ glens.search_many(
 
 Run [`search()`](#search) over several images, preserving order. All keyword arguments are forwarded to each `search()` call.
 
-- Lookups **serialize** through the module lock (see [Guide §14](GUIDE.md#14-performance--concurrency)).
+- This helper processes images sequentially and preserves order. Separate `search()` calls can overlap on the requests backend; browser fallbacks are serialized.
 - A failed lookup becomes a `None` entry rather than aborting the batch.
 - Returns a list the same length and order as `images`.
 
@@ -371,11 +371,11 @@ All are **defaults** overridden by explicit arguments. Precedence: **argument > 
 | `GLENS_HEADLESS` | flag | `1` (headless) | Bundled Chrome headless mode. **Setting it (to anything) also disables the visible-window gate-retry.** |
 | `GLENS_CHROME_PROFILE` | path | *(none)* | Persistent Chrome profile dir for `build_driver`. |
 
-**Malformed integers** (e.g. `GLENS_MAX_MATCHES=lots`) are ignored with a warning and fall back to the default — they never break `import glens`. Integer minimums are clamped (e.g. `GLENS_RESULT_TIMEOUT` is at least 5).
+**Malformed integers** (e.g. `GLENS_MAX_MATCHES=lots`) are ignored with a warning and fall back to the default — they never break `import glens`.
 
 **Flag parsing:** `GLENS_CACHE` is truthy for `1`/`true`/`yes`/`on` (case-insensitive); anything else is off. `GLENS_HEADLESS` is falsy for `0`/`false`/`no`/`off`/empty and truthy otherwise.
 
-**When each variable is read:** the numeric/flag defaults — `GLENS_BACKEND`, `GLENS_MAX_MATCHES`, `GLENS_MAX_TITLES`, `GLENS_RESULT_TIMEOUT`, `GLENS_LANG`, `GLENS_CACHE`, `GLENS_CACHE_TTL` — are resolved **once, at import time**, into module constants. Set them in the process environment *before* `import glens`; mutating `os.environ[...]` afterward has no effect (pass a per-call argument instead). By contrast, `GLENS_COOKIE_FILE` and `GLENS_CACHE_DIR` are read **per call**, and `GLENS_HEADLESS`/`GLENS_CHROME_PROFILE` **per browser build**, so those *can* be changed at runtime. This matters mostly for tests and notebooks that set env vars programmatically.
+**When each variable is read:** the numeric/flag defaults — `GLENS_BACKEND`, `GLENS_MAX_MATCHES`, `GLENS_MAX_TITLES`, `GLENS_RESULT_TIMEOUT`, `GLENS_LANG`, `GLENS_CACHE`, `GLENS_CACHE_TTL` — are resolved **once, at import time**, into module constants. Set them before importing the library; mutating `os.environ[...]` afterward has no effect.
 
 ---
 

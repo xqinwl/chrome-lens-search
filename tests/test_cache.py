@@ -189,9 +189,9 @@ def test_shaping_applies_to_cached_items(monkeypatch, tmp_path, cache_dir):
 
 
 def test_concurrent_writers_get_distinct_tmp_paths(monkeypatch, tmp_path, cache_dir):
-    """_cache_write runs OUTSIDE _lens_lock, so two threads looking up the same
-    image+lang reach it at once. A tmp name keyed only on the pid gave them one
-    shared path, and a rename could publish a half-written entry."""
+    """Independent lookups can publish the same image+lang at once. A tmp name
+    keyed only on the pid gave concurrent writers one shared path and a rename could
+    publish a half-written entry."""
     import threading
 
     key = _cache_key(b"synthetic-image", None)

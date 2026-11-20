@@ -44,7 +44,7 @@ async def test_url_and_upload_share_contract(client, monkeypatch):
     assert by_file.json() == by_url.json() == {
         "top_title": "Shoe", "titles": ["Shoe"],
         "matches": [{"title": "Shoe", "url": "https://a.com", "domain": "a.com"}]}
-    assert calls == [(image, options)] * 2
+    assert calls == [(image, {**options, "raise_on_rate_limit": True})] * 2
 
 
 @pytest.mark.parametrize("outcome,code", [(None, 502), (lens.LensResult(None, [], []), 200)])
@@ -56,6 +56,36 @@ async def test_empty_and_inconclusive(client, monkeypatch, outcome, code):
         assert r.json() == {"top_title": None, "titles": [], "matches": []}
     else:
         assert r.json()["error"]["code"] == "lens_lookup_failed"
+
+
+async def test_upstream_rate_limit_is_visible_to_client(client, monkeypatch):
+    def rate_limited(*args, **kwargs):
+        raise lens.LensRateLimitError("12")
+
+    monkeypatch.setattr(server, "_search_bytes", rate_limited)
+    r = await client.post("/v1/search", files={"image": ("a.png", lens._tiny_png())})
+    assert r.status_code == 429
+    assert r.json()["error"]["code"] == "upstream_rate_limited"
+    assert r.headers["retry-after"] == "12"
+
+
+async def test_requests_backend_searches_can_overlap(monkeypatch):
+    started = threading.Barrier(3)
+
+    def lookup(*_):
+        started.wait(timeout=5)
+        return {"top_title": None, "titles": [], "matches": []}
+
+    monkeypatch.setattr(server, "_lookup", lookup)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.create_app()),
+        base_url="http://test",
+    ) as parallel_client:
+        responses = await asyncio.gather(*[
+            parallel_client.post("/v1/search", json={"image_url": "https://img.example/a"})
+            for _ in range(3)
+        ])
+    assert [response.status_code for response in responses] == [200, 200, 200]
 
 
 @pytest.mark.parametrize("kwargs,code", [
@@ -74,12 +104,20 @@ async def test_bad_input(client, kwargs, code):
     assert set(r.json()["error"]) == {"code", "message"}
 
 
-def test_cancellation_keeps_capacity_and_probes_responsive(monkeypatch):
+def test_cancellation_does_not_block_other_searches_or_health(monkeypatch):
     started = threading.Event()
+    both_started = threading.Event()
     finish = threading.Event()
+    count = 0
+    count_lock = threading.Lock()
 
     def lookup(*_):
-        started.set()
+        nonlocal count
+        with count_lock:
+            count += 1
+            started.set()
+            if count >= 2:
+                both_started.set()
         assert finish.wait(10)
         return {"titles": []}
 
@@ -97,16 +135,14 @@ def test_cancellation_keeps_capacity_and_probes_responsive(monkeypatch):
                 running.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await running
-                waiting = [submit(), submit()]
-                await asyncio.sleep(0)
-                busy = await client.post("/v1/search", content=b"invalid")
-                assert busy.status_code == 429
+                parallel = submit()
+                assert await asyncio.to_thread(both_started.wait, 3)
                 assert (await client.get("/healthz")).json() == {"ok": True}
                 assert set((await client.get("/v1/status")).json()) == {
                     "req_ready", "default_backend", "cache_enabled", "jar_age_seconds"}
             finally:
                 finish.set()
-            assert all(r.status_code == 200 for r in await asyncio.gather(*waiting))
+            assert (await parallel).status_code == 200
             assert (await submit()).status_code == 200
 
     asyncio.run(exercise())

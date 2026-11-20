@@ -59,6 +59,9 @@ class RecordingSession:
         self.gets.append(url)
         return self._Resp(url, SYNTHETIC_RESULTS_HTML)
 
+    def close(self):
+        pass
+
 
 @pytest.fixture
 def jar_file(tmp_path):

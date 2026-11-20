@@ -154,7 +154,15 @@ _BARE_DOMAIN = re.compile(
 # flattened into the aria-label; everything from the URL on is chrome, not title.
 _EMBEDDED_URL = re.compile(r"\s*(?:https?://|www\.)\S*.*$", re.IGNORECASE)
 
-_lens_lock = threading.Lock()
+_browser_lock = threading.Lock()
+
+
+class LensRateLimitError(RuntimeError):
+    """Google Lens explicitly refused a request with HTTP 429."""
+
+    def __init__(self, retry_after: str | None = None):
+        super().__init__("Google Lens rate limited the request.")
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -511,9 +519,8 @@ def _cache_write(key: str, items: list[dict], results_url: str | None) -> None:
         cache_dir = _default_cache_dir()
         cache_dir.mkdir(parents=True, exist_ok=True)
         # Write-then-rename so concurrent writers can't leave a torn entry.
-        # pid AND thread id: _cache_write runs outside _lens_lock, so two threads
-        # looking up the same image+lang shared one tmp path and could rename a
-        # half-written file into place.
+        # pid AND thread id: concurrent searches for the same image+lang need
+        # distinct tmp paths so one writer cannot rename another's partial file.
         tmp = cache_dir / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
         tmp.write_text(
             json.dumps({"saved_at": time.time(), "results_url": results_url, "items": items}),
@@ -561,7 +568,9 @@ def _save_cookie_jar(driver, cookie_file: Path) -> None:
         # Write-then-rename: a crash or a full disk mid-write would otherwise
         # truncate the jar in place, and a half-written jar is unloadable --
         # taking out the working fast path this run was only meant to refresh.
-        tmp = cookie_file.with_name(f"{cookie_file.name}.{os.getpid()}.tmp")
+        tmp = cookie_file.with_name(
+            f"{cookie_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         tmp.write_text(
             json.dumps({"user_agent": ua, "cookies": cookies, "minted_at": time.time()}),
             encoding="utf-8",
@@ -840,6 +849,7 @@ def _search_via_requests(
             if not _looks_like_results_url(results_url):
                 logger.info("glens req upload didn't yield a results URL (%s); falling back.",
                             results_url[:120])
+                session.close()
                 return None, None
             html = resp.text
             items = _parse_anchors_from_html(html)
@@ -863,15 +873,21 @@ def _search_via_requests(
                 else:
                     logger.info("glens req backend: only %d external anchor(s); "
                                 "falling back.", len(external))
+                session.close()
                 return None, results_url
             logger.info("glens req backend: harvested %d anchor(s) without a browser.",
                         len(items))
+            session.close()
             return items, results_url
         except requests.HTTPError as exc:
-            # A hard status (403/429/...) is deterministic, not transient: retrying
-            # re-uploads the image to an endpoint that just refused it. Fall back
+            if exc.response is not None and exc.response.status_code == 429:
+                session.close()
+                raise LensRateLimitError(exc.response.headers.get("Retry-After")) from exc
+            # A hard status is deterministic, not transient: retrying re-uploads
+            # the image to an endpoint that just refused it. Fall back
             # now so the browser can re-mint the jar.
             logger.info("glens req backend: HTTP error (%s); falling back to the browser.", exc)
+            session.close()
             return None, results_url
         except requests.RequestException as exc:
             last_exc = exc
@@ -879,6 +895,7 @@ def _search_via_requests(
                         attempt, _REQ_ATTEMPTS, exc)
     logger.info("glens req backend gave up after %d attempts (%s); falling back to the browser.",
                 _REQ_ATTEMPTS, last_exc)
+    session.close()
     return None, None
 
 
@@ -1282,6 +1299,7 @@ def _search_bytes(
     cookie_file: str | os.PathLike | None = None, max_matches: int | None = None,
     max_titles: int | None = None, timeout: int | None = None, lang: str | None = None,
     use_cache: bool | None = None, resolve_links: bool = False,
+    raise_on_rate_limit: bool = False,
 ) -> LensResult | None:
     """Return None for inconclusive lookups and an empty LensResult for confirmed misses."""
     backend = (backend or "").strip().lower() or DEFAULT_BACKEND
@@ -1310,13 +1328,20 @@ def _search_bytes(
             items, results_url = cached
             cache_hit = True
 
-    if items is None:
-        with _lens_lock:
-            if backend in ("auto", "req"):
-                items, results_url = _search_via_requests(frame_bytes, cookie_path, lang)
-            if items is None and backend in ("auto", "browser"):
-                items, results_url = _search_via_browser(frame_bytes, cookie_path, timeout,
-                                                         driver_factory)
+    if items is None and backend in ("auto", "req"):
+        try:
+            items, results_url = _search_via_requests(frame_bytes, cookie_path, lang)
+        except LensRateLimitError:
+            if raise_on_rate_limit:
+                raise
+            logger.info("glens req backend received an upstream rate limit.")
+            return None
+    if items is None and backend in ("auto", "browser"):
+        # Keep browser use single-filed because it may share a persistent Chrome
+        # profile and refresh the cookie jar. Request-backed searches can overlap.
+        with _browser_lock:
+            items, results_url = _search_via_browser(frame_bytes, cookie_path, timeout,
+                                                     driver_factory)
     if items is None:
         return None
     if items == []:
@@ -1353,9 +1378,10 @@ def search_many(
 ) -> list[LensResult | None]:
     """Run :func:`search` over several images, preserving order.
 
-    Keyword arguments are forwarded to each ``search()`` call. Lookups serialise
-    through the module lock (be gentle, see the README); a failed lookup yields a
-    ``None`` entry instead of aborting the whole batch.
+    Keyword arguments are forwarded to each ``search()`` call. This helper runs
+    the list sequentially and preserves order; separate ``search()`` calls may
+    overlap on the requests backend. A failed lookup yields a ``None`` entry
+    instead of aborting the whole batch.
     """
     return [search(image, **kwargs) for image in images]
 
@@ -1449,7 +1475,7 @@ def warmup(
     # A junk image renders few tiles, so there's no point waiting long: any
     # rendered results page mints the cookies we're after.
     before = _jar_stamp(cookie_path)
-    with _lens_lock:
+    with _browser_lock:
         _search_via_browser(frame_bytes, cookie_path, timeout or 10, driver_factory)
     after = _jar_stamp(cookie_path)
     if after is None:

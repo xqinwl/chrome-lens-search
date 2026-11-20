@@ -17,10 +17,12 @@ _REDIRECTS = {301, 302, 303, 307, 308}
 
 
 class APIError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str,
+                 headers: dict[str, str] | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.headers = headers or {}
 
 
 def too_large() -> APIError:

@@ -63,13 +63,13 @@ curl -H 'Content-Type: application/json' \
 
 Compose 根据宿主机架构构建 Linux AMD64 或 ARM64 镜像，内置 Chromium、配套驱动和用于浏览器重试的虚拟显示器。宿主机通过本地 8000 端口访问，同一 Compose 网络内的容器可访问 `http://glens:8000`。接口面向可信内网，默认免鉴权。若宿主机 8000 端口已被占用，可用 `GLENS_PORT=8080 docker compose up -d` 切换宿主机端口。
 
-首次查询按需建立会话。Chrome 先尝试无头模式，Google 返回不完整页面时，会在虚拟显示器中重试。`/data` 命名卷保存 Cookie 和可选的结果缓存，重启或重建容器后仍可复用。要在接入流量前预热，可运行 `docker compose exec glens glens warmup`。`GET /healthz` 用于检查 HTTP 服务是否在线。`GET /v1/status` 显示后端、缓存开关、本地会话文件是否可读及其年龄，会话是否仍被 Google 接受由实际查询验证。
+首次查询按需建立会话。Chrome 先尝试无头模式，Google 返回不完整页面时，会在虚拟显示器中重试。`/data` 命名卷保存 Cookie 和可选的结果缓存，重启或重建容器后仍可复用。要在接入流量前预热，可运行 `docker compose exec glens glens warmup`。`GET /healthz` 用于检查 HTTP 服务是否在线。`GET /v1/status` 显示后端、缓存开关、本地会话文件是否可读及其年龄，以及允许的搜索并发数；会话是否仍被 Google 接受由实际查询验证。
 
 两种输入均支持 `lang`、`max_matches`、`max_titles`、`resolve_links`。单图上限为 10 MiB。远程 URL 和各次重定向都须指向公网 HTTP(S) 地址。成功响应包含 `top_title`、`titles` 和 `matches`，每条匹配含 `title`、`url`、`domain`。确认无匹配时返回 HTTP 200，标题为 null，列表为空。
 
 如果 Docker DNS 将图片域名解析成 Clash Fake-IP 地址（例如 `198.18.x.x`），需要让 Clash 对该域名返回真实公网地址。在 Clash Verge 配置中，将 `cdn.globus.pictures` 加入 `dns.fake-ip-filter`。如果还希望该 CDN 直连，再在兜底代理规则前添加 `DOMAIN,cdn.globus.pictures,DIRECT`。修改 DNS 规则后重建容器，让它重新解析域名。API 会拒绝虚拟、内网和保留 IP，这是服务端防止请求伪造的安全校验。
 
-错误格式为 `{"error":{"code":"…","message":"…"}}`。413 表示请求过大，415 表示内容格式不受支持，422 表示输入无效。服务同时执行一笔查询，允许两笔等待，队列满时返回 429。502 的错误码区分图片下载失败（`image_download_failed`）与 Lens 查询失败或结果无法判断（`lens_lookup_failed`）。
+requests 后端支持独立搜索并发，HTTP API 不额外设置并发上限；实际吞吐受 Python worker pool 和可用资源影响。浏览器回退和会话刷新仍会串行执行，以保护共享的 Chrome 配置和 Cookie 文件。错误格式为 `{"error":{"code":"…","message":"…"}}`。413 表示请求过大，415 表示内容格式不受支持，422 表示输入无效。HTTP 429 `upstream_rate_limited` 表示 Google Lens 明确返回了 429（若 Google 提供 `Retry-After`，响应会带上该头）。502 的错误码区分图片下载失败（`image_download_failed`）与 Lens 查询失败或结果无法判断（`lens_lookup_failed`）。
 
 从源码直接运行可使用 `pip install ".[server,browser]"` 和 `glens serve`，默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 调整。
 

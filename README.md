@@ -57,13 +57,13 @@ curl -H 'Content-Type: application/json' \
 
 Compose builds for the host architecture (Linux AMD64 or ARM64) with Chromium, its matching driver, and a virtual display for browser retries. It publishes port 8000 on localhost. Other containers on the Compose network can use `http://glens:8000`. The API is intended for trusted clients with no application-level authentication. Use `GLENS_PORT=8080 docker compose up -d` if host port 8000 is occupied.
 
-The first search creates a session on demand. Chrome tries headless first and retries with the virtual display if Google returns an incomplete page. The named volume mounted at `/data` preserves the session and optional result cache across restarts and rebuilds. To prewarm before accepting traffic, run `docker compose exec glens glens warmup`. `GET /healthz` reports HTTP availability. `GET /v1/status` reports the backend, cache setting, and local cookie-file readiness and age. A live query verifies whether Google still accepts the session.
+The first search creates a session on demand. Chrome tries headless first and retries with the virtual display if Google returns an incomplete page. The named volume mounted at `/data` preserves the session and optional result cache across restarts and rebuilds. To prewarm before accepting traffic, run `docker compose exec glens glens warmup`. `GET /healthz` reports HTTP availability. `GET /v1/status` reports the backend, cache setting, local cookie-file readiness and age, and the concurrent search limit. A live query verifies whether Google still accepts the session.
 
 Search accepts `lang`, `max_matches`, `max_titles`, and `resolve_links` as JSON or multipart fields. The 10 MiB limit applies to each image. URL downloads and redirects must resolve to public HTTP(S) destinations. A successful response contains `top_title`, `titles`, and `matches` (each with `title`, `url`, and `domain`). A confirmed miss returns HTTP 200 with a null title and empty lists.
 
 If Docker DNS returns a Clash fake IP such as `198.18.x.x` for an image host, configure Clash to return the host's real public address. For Clash Verge, add `cdn.globus.pictures` to `dns.fake-ip-filter`. To route that CDN directly, also place `DOMAIN,cdn.globus.pictures,DIRECT` before the profile's catch-all proxy rule. Recreate the container after changing DNS settings so it resolves the host again. The API rejects fake, private, and reserved addresses as a server-side request forgery safeguard.
 
-Errors use `{"error":{"code":"…","message":"…"}}`. HTTP 413 means too large, 415 unsupported content, and 422 invalid input. The server runs one lookup with two waiting places, returning 429 when full. HTTP 502 distinguishes image download failures (`image_download_failed`) from an inconclusive Lens lookup (`lens_lookup_failed`).
+The requests backend can run independent searches in parallel, with no extra API-level concurrency limit; actual throughput depends on the Python worker pool and available resources. Browser fallbacks and session refreshes are serialized to protect the shared Chrome profile and cookie jar. Errors use `{"error":{"code":"…","message":"…"}}`. HTTP 413 means too large, 415 unsupported content, and 422 invalid input. HTTP 429 `upstream_rate_limited` means Google Lens explicitly returned 429 (and includes `Retry-After` when Google sends it). HTTP 502 distinguishes image download failures (`image_download_failed`) from an inconclusive Lens lookup (`lens_lookup_failed`).
 
 To serve directly from a checkout, install `pip install ".[server,browser]"` and run `glens serve`. The default is `127.0.0.1:8000`; use `--host` and `--port` to change it.
 
@@ -196,7 +196,7 @@ for path in my_images:
 - **`glens.status()`** — JSON-safe health dict: is the session jar valid, how old is it, is the browser extra installed, is the fast path (`req_ready`) available. Same thing on the CLI: `glens status --json` (exit 0 = ready), perfect for container health checks.
 - **`glens.warmup()`** — mints the jar with one browser run and returns `True` when ready; a no-op if the jar already exists. CLI: `glens warmup`. Run it once at container start or CI setup, then use `backend="req"` at runtime so production code can never accidentally launch Chrome.
 - **Headless servers without Chrome:** run `glens warmup` on any machine that has Chrome, ship the jar file (`GLENS_COOKIE_FILE`), and the server only ever needs the slim `requests` core.
-- **Batch jobs:** see [examples/batch_folder.py](examples/batch_folder.py) — folder in, CSV of product matches out. Calls serialise through an in-process lock; keep it to one image at a time and don't hammer.
+- **Batch jobs:** see [examples/batch_folder.py](examples/batch_folder.py) — folder in, CSV of product matches out. `search_many()` processes items sequentially; independent calls can overlap, so keep concurrency modest and don't hammer Google.
 
 For machine consumption, `result.to_dict()` gives you JSON-ready output, and the CLI's `--json` + exit codes (0 results / 1 none / 2 usage) script cleanly.
 
@@ -247,7 +247,7 @@ Best-effort by design: Google decides, and the country/market always follows you
 - **This scrapes an undocumented Google endpoint.** It is not an official API, and it's against Google's Terms of Service. Use it where that's acceptable to you.
 - **It will break.** Google changes the endpoint, the JS-gate behaviour, and the markup without notice. When that happens the harvesting is deliberately *selector-light* (anchors + aria-labels, no hardcoded class names) so it degrades rather than shatters — but expect to patch it. PRs welcome.
 - **Results are noisy by design.** The parser favours recall; verify matches downstream if you need precision.
-- **Be gentle.** One image per lookup, a module lock serialises calls in-process. Don't hammer it.
+- **Be gentle.** Searches can run concurrently. Keep batches modest; the endpoint publishes no guaranteed rate limit, and aggressive use can trigger 403/429 responses or age the session faster.
 
 ## Documentation
 

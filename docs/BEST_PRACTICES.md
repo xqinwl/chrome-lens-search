@@ -69,9 +69,9 @@ export GLENS_BACKEND=req
 
 ## 3. Be gentle — respect the endpoint
 
-**Rule:** one image per lookup, don't parallelize to blast Google, and add your own pacing for bulk work.
+**Rule:** one image per lookup, keep parallel batches small, and add your own pacing for bulk work.
 
-glens already serializes every lookup through an in-process lock, so `search()` from multiple threads queues rather than stampedes. That protects a single process — it does **not** stop you from launching 50 processes. Don't.
+Requests-backed `search()` calls can overlap; the HTTP server does not add its own API-level concurrency limit. Worker-pool size and available resources still bound actual throughput, and separate processes add their own traffic. Start small, observe upstream 429 responses, and don't launch a large fan-out.
 
 For bulk jobs, go one at a time and consider a small delay:
 
@@ -188,7 +188,7 @@ logging.getLogger("glens").setLevel(logging.INFO)
 Watch for these signals:
 
 - `JS-gate shell served (stale/weak jar); falling back` — normal self-heal (on `auto`); a **cluster** of these means your jar keeps going stale — mint less aggressively or refresh proactively.
-- `req backend: HTTP error (403/429...)` — you're being throttled/blocked; back off.
+- `upstream_rate_limited` / Google HTTP 429 — pause requests and honor `Retry-After` when present.
 - `headless Chrome got a degraded page; retrying...with a visible window` — expected on desktops; a **problem on headless servers** (see [§9](#9-deploy-defensively)).
 - `browser backend unavailable` — the `[browser]` extra isn't installed where a mint was needed.
 

@@ -30,7 +30,12 @@ class FakeResponse:
 
     def raise_for_status(self):
         if self.status >= 400:
-            raise requests.HTTPError(f"synthetic {self.status}")
+            response = requests.Response()
+            response.status_code = self.status
+            response.url = self.url
+            if self.status == 429:
+                response.headers["Retry-After"] = "8"
+            raise requests.HTTPError(f"synthetic {self.status}", response=response)
 
 
 class FlakySession:
@@ -52,6 +57,9 @@ class FlakySession:
 
     def get(self, *args, **kwargs):
         return FakeResponse(self.url, self.html, self.status)
+
+    def close(self):
+        pass
 
 
 @pytest.fixture
@@ -109,14 +117,14 @@ def test_no_jar_short_circuits(tmp_path):
 
 
 def test_http_error_does_not_retry(monkeypatch, jar_file):
-    # A hard status (403/429) is deterministic: no second upload of the image.
+    # Upstream 429 is surfaced clearly and never retried through another backend.
     session = FlakySession(fail_first=0, status=429)
     monkeypatch.setattr(lens_mod, "_req_session", lambda jar, lang=None: session)
 
-    items, url = lens_mod._search_via_requests(b"img", jar_file)
-
+    with pytest.raises(lens_mod.LensRateLimitError) as exc:
+        lens_mod._search_via_requests(b"img", jar_file)
     assert session.posts == 1
-    assert items is None and url is None
+    assert exc.value.retry_after == "8"
 
 
 def test_non_results_redirect_falls_back(monkeypatch, jar_file):

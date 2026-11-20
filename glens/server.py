@@ -1,4 +1,4 @@
-"""Single-worker HTTP API, loaded only by the optional server entry point."""
+"""Single-process HTTP API, loaded only by the optional server entry point."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException
 from starlette.formparsers import MultiPartException, MultiPartParser
 
-from .lens import _search_bytes, status
+from .lens import LensRateLimitError, _search_bytes, status
 from .server_images import MAX_IMAGE_BYTES, APIError, download_image, too_large, validate_image
 
 
@@ -79,7 +79,12 @@ async def _read_input(request: Request) -> tuple[bytes | str, SearchOptions]:
 def _lookup(source: bytes | str, options: SearchOptions) -> dict:
     data = download_image(source) if isinstance(source, str) else source
     validate_image(data)
-    result = _search_bytes(data, **options.model_dump())
+    try:
+        result = _search_bytes(data, raise_on_rate_limit=True, **options.model_dump())
+    except LensRateLimitError as exc:
+        headers = {"Retry-After": exc.retry_after} if exc.retry_after else None
+        raise APIError(429, "upstream_rate_limited",
+                       "Google Lens rate limited this search.", headers=headers) from exc
     if result is None:
         raise APIError(502, "lens_lookup_failed", "Lens did not return a usable results page.")
     return {"top_title": result.top_title, "titles": result.titles,
@@ -88,13 +93,11 @@ def _lookup(source: bytes | str, options: SearchOptions) -> dict:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="glens", version="1")
-    active = asyncio.Lock()
-    admitted = 0
 
     @app.exception_handler(APIError)
     async def api_error(request: Request, exc: APIError):
         return JSONResponse({"error": {"code": exc.code, "message": str(exc)}},
-                            status_code=exc.status)
+                            status_code=exc.status, headers=exc.headers)
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
@@ -123,31 +126,10 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/search", openapi_extra={"requestBody": request_body})
     async def search_endpoint(request: Request):
-        nonlocal admitted
-        # Admission and release run on the event loop, before reading any request bytes.
-        if admitted >= 3:
-            raise APIError(429, "server_busy", "Search queue is full.")
-        admitted += 1
-        try:
-            source, options = await _read_input(request)
-            await active.acquire()
-        except BaseException:
-            admitted -= 1
-            raise
-
-        def release(future=None):
-            nonlocal admitted
-            if future is not None and not future.cancelled():
-                future.exception()  # Observe failures even if the client already disconnected.
-            admitted -= 1
-            active.release()
-
-        try:
-            worker = asyncio.get_running_loop().run_in_executor(None, _lookup, source, options)
-        except BaseException:
-            release()
-            raise
-        worker.add_done_callback(release)
+        source, options = await _read_input(request)
+        worker = asyncio.get_running_loop().run_in_executor(None, _lookup, source, options)
+        worker.add_done_callback(lambda future: future.exception()
+                                 if not future.cancelled() else None)
         # Cancellation of an HTTP handler cannot stop a running browser thread.
         return await asyncio.shield(worker)
 
