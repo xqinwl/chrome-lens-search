@@ -50,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Unofficial Google Lens visual product search: image in, "
                     "product titles + merchant links out.",
         epilog="examples:  glens photo.jpg   |   glens --json https://... "
-               "  |   glens warmup   |   glens status",
+               "  |   glens warmup   |   glens status   |   glens serve",
     )
     parser.add_argument("--version", action="version", version=f"glens {__version__}")
     parser.add_argument("image", help="path or http(s) URL of the image")
@@ -189,8 +189,29 @@ def _cmd_warmup(argv: list[str]) -> int:
     return 1
 
 
+def _cmd_serve(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="glens serve", description="Serve the Lens HTTP API.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+    try:
+        import uvicorn
+
+        from .server import app
+    except ImportError as exc:
+        print(f'glens serve requires the [server] extra ({exc}). '
+              'Install chrome-lens-search[server].', file=sys.stderr)
+        return 2
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "serve":
+        return _cmd_serve(argv[1:])
     if argv and argv[0] == "status":
         return _cmd_status(argv[1:])
     if argv and argv[0] == "warmup":

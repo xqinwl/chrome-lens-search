@@ -400,3 +400,17 @@ def test_missing_browser_extra_warns_loudly(tmp_path, caplog):
     assert items is None and url is None
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings and "browser backend unavailable" in warnings[0].getMessage()
+
+
+def test_explicit_empty_browser_page_is_a_confirmed_miss(monkeypatch, tmp_path):
+    class EmptyPage(FakeDriver):
+        current_url = RESULTS_URL
+
+        def execute_script(self, script):
+            return "no visual matches found" in script
+
+    _wire_browser_internals(monkeypatch, RESULTS_URL, [])
+    opts = dict(backend="browser", driver_factory=EmptyPage, cookie_file=tmp_path / "cookies.json")
+    assert lens_mod._search_bytes(b"img", **opts) == lens_mod.LensResult(None, [], [],
+                                                                         results_url=RESULTS_URL)
+    assert glens.search(b"img", **opts) is None

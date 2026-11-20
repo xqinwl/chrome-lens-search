@@ -1,4 +1,4 @@
-# Tests are hermetic: no network, no browser. Never run the browser backend here.
+# Unit tests are offline. Container smoke tests open a local page in the bundled browser.
 name: CI
 
 on:
@@ -50,3 +50,27 @@ jobs:
           cd /tmp   # step out of the repo so the wheel, not the source tree, is imported
           python -c "import glens; print('wheel ok:', glens.__version__)"
           glens --version
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -e ".[dev,server]"
+      - run: pytest tests/test_server.py tests/test_server_images.py
+
+  container:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build --wait
+      - run: docker compose exec -T glens python - < tests/container_smoke.py
+      - if: failure()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down -v

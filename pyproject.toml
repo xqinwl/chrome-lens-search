@@ -35,10 +35,20 @@ browser = [
     "undetected-chromedriver>=3.5",
     "selenium>=4.10",
 ]
+server = [
+    "fastapi>=0.115.12",
+    "starlette>=0.47.2",
+    "pydantic>=2.7",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.30",
+    "urllib3>=2.2",
+    "Pillow>=10.4",
+]
 # Test/lint tooling; the suite needs no network and no browser.
 dev = [
     "pytest>=7.4",
     "ruff>=0.4",
+    "httpx>=0.27,<1",
 ]
 
 [project.scripts]

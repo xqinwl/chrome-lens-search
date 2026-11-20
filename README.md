@@ -42,6 +42,33 @@ if result:                             # None when the lookup fails
 [goat.com]      Air Max 90 -> https://www.goat.com/...
 ```
 
+## HTTP service and Docker
+
+From the project directory, start the service and submit a local file or a public image URL. Replace the sample filename or URL with your image.
+
+```bash
+docker compose up -d --build
+curl http://localhost:8000/healthz
+curl -F 'image=@shoe.jpg' -F 'lang=zh-CN' http://localhost:8000/v1/search
+curl -H 'Content-Type: application/json' \
+  -d '{"image_url":"https://example.com/shoe.jpg","max_matches":5}' \
+  http://localhost:8000/v1/search
+```
+
+Compose builds for the host architecture (Linux AMD64 or ARM64) with Chromium, its matching driver, and a virtual display for browser retries. It publishes port 8000 on localhost. Other containers on the Compose network can use `http://glens:8000`. The API is intended for trusted clients with no application-level authentication. Use `GLENS_PORT=8080 docker compose up -d` if host port 8000 is occupied.
+
+The first search creates a session on demand. Chrome tries headless first and retries with the virtual display if Google returns an incomplete page. The named volume mounted at `/data` preserves the session and optional result cache across restarts and rebuilds. To prewarm before accepting traffic, run `docker compose exec glens glens warmup`. `GET /healthz` reports HTTP availability. `GET /v1/status` reports the backend, cache setting, and local cookie-file readiness and age. A live query verifies whether Google still accepts the session.
+
+Search accepts `lang`, `max_matches`, `max_titles`, and `resolve_links` as JSON or multipart fields. The 10 MiB limit applies to each image. URL downloads and redirects must resolve to public HTTP(S) destinations. A successful response contains `top_title`, `titles`, and `matches` (each with `title`, `url`, and `domain`). A confirmed miss returns HTTP 200 with a null title and empty lists.
+
+If Docker DNS returns a Clash fake IP such as `198.18.x.x` for an image host, configure Clash to return the host's real public address. For Clash Verge, add `cdn.globus.pictures` to `dns.fake-ip-filter`. To route that CDN directly, also place `DOMAIN,cdn.globus.pictures,DIRECT` before the profile's catch-all proxy rule. Recreate the container after changing DNS settings so it resolves the host again. The API rejects fake, private, and reserved addresses as a server-side request forgery safeguard.
+
+Errors use `{"error":{"code":"…","message":"…"}}`. HTTP 413 means too large, 415 unsupported content, and 422 invalid input. The server runs one lookup with two waiting places, returning 429 when full. HTTP 502 distinguishes image download failures (`image_download_failed`) from an inconclusive Lens lookup (`lens_lookup_failed`).
+
+To serve directly from a checkout, install `pip install ".[server,browser]"` and run `glens serve`. The default is `127.0.0.1:8000`; use `--host` and `--port` to change it.
+
+If a URL returns `422 invalid_image_url`, check that the hostname and every redirect resolve to public IP addresses. A `502 image_download_failed` means the URL host could not serve the image. A `502 lens_lookup_failed` with `req_ready: false` after cold start means no usable Lens session was established. Run `docker compose exec glens glens warmup -v` to inspect the browser step.
+
 ---
 
 ## Why this exists

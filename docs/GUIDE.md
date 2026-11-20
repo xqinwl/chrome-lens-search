@@ -316,17 +316,10 @@ When the jar eventually goes stale, re-mint it the same way and redeploy the fil
 
 ### Recipe: Docker (self-minting)
 
-If your container *does* have Chrome, warm up at container start:
-
-```dockerfile
-FROM python:3.12-slim
-RUN apt-get update && apt-get install -y chromium && rm -rf /var/lib/apt/lists/*
-RUN pip install "chrome-lens-search[browser]"
-ENV GLENS_HEADLESS=1
-# Warm up at build or entrypoint time; then your app uses backend="req".
-```
-
-> **Headless-server gotcha.** By default, if headless Chrome gets a degraded page, glens retries once with a **visible** window — which fails on a box with no display. On a headless server, set `GLENS_HEADLESS=1`. That keeps Chrome headless *and* disables the visible-window retry (see [§16](#16-how-it-works-under-the-hood)). If headless itself gets gated in your environment, run under `xvfb-run` so a virtual display is available.
+Run `docker compose up -d --build` from the repository to serve the API on localhost.
+The image includes Chromium and a matching driver, launches headless on demand,
+and stores the session in the Compose data volume. See the
+[HTTP service quickstart](../README.md#http-service-and-docker) for requests and operations.
 
 ### Recipe: CI / cron warmups
 

@@ -105,18 +105,25 @@ def build_driver(*, headless: bool | None = None, user_data_dir: str | os.PathLi
             options.add_argument(f"--user-data-dir={user_data_dir}")
         return options
 
+    driver_path = os.getenv("GLENS_CHROMEDRIVER_PATH")
+    browser_path = os.getenv("GLENS_CHROMIUM_PATH")
+    binaries = {}
+    if driver_path:
+        binaries["driver_executable_path"] = driver_path
+    if browser_path:
+        binaries["browser_executable_path"] = browser_path
     try:
-        driver = uc.Chrome(options=make_options())
+        driver = uc.Chrome(options=make_options(), **binaries)
     except Exception as exc:
         # The classic cold-start failure: uc fetched a chromedriver one major
         # version ahead of the installed Chrome. The error names the installed
         # version, so retry pinned to it.
         major = _parse_browser_major(str(exc))
-        if major is None:
+        if major is None or driver_path:
             raise
         logger.warning("glens: chromedriver/Chrome version mismatch; retrying "
                        "pinned to Chrome %d.", major)
-        driver = uc.Chrome(options=make_options(), version_main=major)
+        driver = uc.Chrome(options=make_options(), version_main=major, **binaries)
     driver.set_page_load_timeout(60)
     return driver
 

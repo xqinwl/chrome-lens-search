@@ -1111,6 +1111,16 @@ def _browser_pass(frame_bytes: bytes, cookie_file: Path, result_timeout: int,
         else:
             logger.info("glens browser: page looks degraded (%d anchor(s)); "
                         "not saving the jar.", len(items or []))
+        if not _to_matches(items or [], 1) and not _to_titles(items or [], 1):
+            # Empty and degraded pages can look alike. Only an explicit visible empty
+            # state on a Lens results page establishes a miss without harvested tiles.
+            page = getattr(driver, "current_url", "")
+            if _looks_like_results_url(page) and driver.execute_script(
+                r"""return (document.body.innerText || '').split(/\r?\n/).some(
+                    line => /^(no results found|no matches found|no visual matches found)[.!]?$/i
+                        .test(line.trim()));"""
+            ):
+                return [], results_url
         return (items or None), results_url
     except ImportError as exc:
         # The [browser] extra isn't installed. This is the most common first-run
@@ -1145,13 +1155,14 @@ def _search_via_browser(frame_bytes: bytes, cookie_file: Path, result_timeout: i
     """
     items, results_url = _browser_pass(frame_bytes, cookie_file, result_timeout,
                                        driver_factory)
-    if not _looks_rendered(items) and _headed_retry_allowed(driver_factory):
+    if items != [] and not _looks_rendered(items) and _headed_retry_allowed(driver_factory):
         logger.warning("glens: headless Chrome got a degraded page; retrying once "
                        "with a visible Chrome window.")
         from .driver import build_driver
         retry_items, retry_url = _browser_pass(frame_bytes, cookie_file, result_timeout,
                                                lambda: build_driver(headless=False))
-        if _looks_rendered(retry_items) or len(retry_items or []) > len(items or []):
+        if (_looks_rendered(retry_items) or len(retry_items or []) > len(items or [])
+                or (retry_items == [] and not items)):
             items, results_url = retry_items, retry_url
         else:
             logger.info("glens: the visible-window retry did no better (%d anchor(s)); "
@@ -1244,13 +1255,6 @@ def search(
     backend = (backend or "").strip().lower() or DEFAULT_BACKEND
     if backend not in _VALID_BACKENDS:
         raise ValueError(f"backend must be one of {_VALID_BACKENDS!r}, not {backend!r}")
-    max_matches = DEFAULT_MAX_MATCHES if max_matches is None else max_matches
-    max_titles = DEFAULT_MAX_TITLES if max_titles is None else max_titles
-    timeout = DEFAULT_RESULT_TIMEOUT if timeout is None else timeout
-    lang = lang or DEFAULT_LANG
-    use_cache = DEFAULT_USE_CACHE if use_cache is None else use_cache
-    cookie_path = Path(cookie_file) if cookie_file else _default_cookie_file()
-
     if isinstance(image, bytes):
         frame_bytes = image
     elif isinstance(image, str) and image.lower().startswith(("http://", "https://")):
@@ -1265,6 +1269,30 @@ def search(
             # Missing, unreadable, locked, or a directory: an ordinary failure.
             logger.info("glens: could not read image %s (%s)", image, exc)
             return None
+
+    result = _search_bytes(frame_bytes, backend=backend, driver_factory=driver_factory,
+                           cookie_file=cookie_file, max_matches=max_matches, max_titles=max_titles,
+                           timeout=timeout, lang=lang, use_cache=use_cache,
+                           resolve_links=resolve_links)
+    return result or None
+
+
+def _search_bytes(
+    frame_bytes: bytes, *, backend: str | None = None, driver_factory: Callable | None = None,
+    cookie_file: str | os.PathLike | None = None, max_matches: int | None = None,
+    max_titles: int | None = None, timeout: int | None = None, lang: str | None = None,
+    use_cache: bool | None = None, resolve_links: bool = False,
+) -> LensResult | None:
+    """Return None for inconclusive lookups and an empty LensResult for confirmed misses."""
+    backend = (backend or "").strip().lower() or DEFAULT_BACKEND
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(f"backend must be one of {_VALID_BACKENDS!r}, not {backend!r}")
+    max_matches = DEFAULT_MAX_MATCHES if max_matches is None else max_matches
+    max_titles = DEFAULT_MAX_TITLES if max_titles is None else max_titles
+    timeout = DEFAULT_RESULT_TIMEOUT if timeout is None else timeout
+    lang = lang or DEFAULT_LANG
+    use_cache = DEFAULT_USE_CACHE if use_cache is None else use_cache
+    cookie_path = Path(cookie_file) if cookie_file else _default_cookie_file()
 
     if driver_factory is None:
         from .driver import build_driver
@@ -1289,8 +1317,10 @@ def search(
             if items is None and backend in ("auto", "browser"):
                 items, results_url = _search_via_browser(frame_bytes, cookie_path, timeout,
                                                          driver_factory)
-    if not items:
+    if items is None:
         return None
+    if items == []:
+        return LensResult(None, [], [], results_url=results_url)
 
     if resolve_links:
         selected_hrefs = {match.url for match in _to_matches(items, max_matches)}
@@ -1301,7 +1331,11 @@ def search(
     matches = _to_matches(items, max_matches)
     titles = _to_titles(items, max_titles)
     if not matches and not titles:
-        return None
+        # An unrecognised page cannot establish a miss. Zero caps can also
+        # intentionally hide otherwise usable results.
+        if not ((max_matches == 0 and _to_matches(items, 1))
+                or (max_titles == 0 and _to_titles(items, 1))):
+            return None
 
     logger.info("glens: %d title(s), %d match(es)", len(titles), len(matches))
     return LensResult(
