@@ -17,8 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 SHORT_DESCRIPTION = (
-    "Unofficial Google Lens visual product search HTTP API with Vercel proxy failover, "
-    "curl_cffi, L1/L2 cache, and rotating logs."
+    "Google Lens visual product search HTTP API with Vercel proxy failover, cache & logs."
 )
 
 
