@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+from typing import Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -13,8 +14,15 @@ from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException
 from starlette.formparsers import MultiPartException, MultiPartParser
 
-from .lens import LensRateLimitError, _search_bytes, status
-from .server_images import MAX_IMAGE_BYTES, APIError, download_image, too_large, validate_image
+from .lens import LensProxyError, LensRateLimitError, _search_bytes, status
+from .server_images import (
+    MAX_IMAGE_BYTES,
+    APIError,
+    compress_image_for_proxy,
+    download_image,
+    too_large,
+    validate_image,
+)
 
 
 class SearchOptions(BaseModel):
@@ -23,6 +31,7 @@ class SearchOptions(BaseModel):
     max_matches: int | None = Field(default=None, ge=0)
     max_titles: int | None = Field(default=None, ge=0)
     resolve_links: bool = False
+    proxy: Literal["vercel"] | None = None
 
 
 class URLSearch(SearchOptions):
@@ -77,14 +86,25 @@ async def _read_input(request: Request) -> tuple[bytes | str, SearchOptions]:
 
 
 def _lookup(source: bytes | str, options: SearchOptions) -> dict:
+    if options.proxy is not None and not isinstance(source, str):
+        raise APIError(422, "proxy_requires_image_url",
+                       "The Vercel proxy requires an HTTP(S) image_url input.")
+    if options.proxy is not None and options.resolve_links:
+        raise APIError(422, "proxy_option_unsupported",
+                       "resolve_links is not supported with the Vercel proxy.")
     data = download_image(source) if isinstance(source, str) else source
     validate_image(data)
+    if options.proxy is not None:
+        data = compress_image_for_proxy(data)
     try:
-        result = _search_bytes(data, raise_on_rate_limit=True, **options.model_dump())
+        result = _search_bytes(data, raise_on_rate_limit=True, raise_on_proxy_error=True,
+                               **options.model_dump())
     except LensRateLimitError as exc:
         headers = {"Retry-After": exc.retry_after} if exc.retry_after else None
         raise APIError(429, "upstream_rate_limited",
                        "Google Lens rate limited this search.", headers=headers) from exc
+    except LensProxyError as exc:
+        raise APIError(502, exc.code, "The Vercel Lens proxy request failed.") from exc
     if result is None:
         raise APIError(502, "lens_lookup_failed", "Lens did not return a usable results page.")
     return {"top_title": result.top_title, "titles": result.titles,

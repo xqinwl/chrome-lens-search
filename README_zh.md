@@ -71,6 +71,8 @@ Compose 根据宿主机架构构建 Linux AMD64 或 ARM64 镜像，内置 Chromi
 
 requests 后端支持独立搜索并发，HTTP API 不额外设置并发上限；实际吞吐受 Python worker pool 和可用资源影响。浏览器回退和会话刷新仍会串行执行，以保护共享的 Chrome 配置和 Cookie 文件。错误格式为 `{"error":{"code":"…","message":"…"}}`。413 表示请求过大，415 表示内容格式不受支持，422 表示输入无效。HTTP 429 `upstream_rate_limited` 表示 Google Lens 明确返回了 429（若 Google 提供 `Retry-After`，响应会带上该头）。502 的错误码区分图片下载失败（`image_download_failed`）与 Lens 查询失败或结果无法判断（`lens_lookup_failed`）。
 
+要通过 Vercel 代理搜索，设置 `GLENS_VERCEL_PROXY_URL` 和 `GLENS_VERCEL_PROXY_SECRET`，并在 JSON 请求中传 `"proxy":"vercel"`。代理模式只接受 `image_url`，复用本地已建立的 Google Cookie，不可用时直接返回错误且不会回退 Chrome；结果缓存会跳过，确保请求确实经过代理。超出 Vercel 请求体预算的图片会转成 JPEG 并压缩。`GLENS_VERCEL_PROXY_SECRET` 必须与 Vercel 项目的 `CRON_SECRET` 一致。
+
 从源码直接运行可使用 `pip install ".[server,browser]"` 和 `glens serve`，默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 调整。
 
 若 URL 返回 `422 invalid_image_url`，请确认图片域名及每次重定向都解析到公网 IP。`502 image_download_failed` 表示图片地址无法访问或拒绝下载。冷启动后若收到 `502 lens_lookup_failed` 且 `req_ready` 为 `false`，表示尚未建立可用 Lens 会话。可运行 `docker compose exec glens glens warmup -v` 检查浏览器步骤。

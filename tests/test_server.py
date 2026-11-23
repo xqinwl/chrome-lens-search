@@ -44,7 +44,8 @@ async def test_url_and_upload_share_contract(client, monkeypatch):
     assert by_file.json() == by_url.json() == {
         "top_title": "Shoe", "titles": ["Shoe"],
         "matches": [{"title": "Shoe", "url": "https://a.com", "domain": "a.com"}]}
-    assert calls == [(image, {**options, "raise_on_rate_limit": True})] * 2
+    assert calls == [(image, {**options, "proxy": None, "raise_on_rate_limit": True,
+                              "raise_on_proxy_error": True})] * 2
 
 
 @pytest.mark.parametrize("outcome,code", [(None, 502), (lens.LensResult(None, [], []), 200)])
@@ -67,6 +68,43 @@ async def test_upstream_rate_limit_is_visible_to_client(client, monkeypatch):
     assert r.status_code == 429
     assert r.json()["error"]["code"] == "upstream_rate_limited"
     assert r.headers["retry-after"] == "12"
+
+
+async def test_vercel_proxy_requires_url_input_and_skips_link_resolution(client, monkeypatch):
+    called = False
+
+    def search(*args, **kwargs):
+        nonlocal called
+        called = True
+        return lens.LensResult(None, [], [])
+
+    monkeypatch.setattr(server, "_search_bytes", search)
+    file_response = await client.post("/v1/search", data={"proxy": "vercel"},
+                                      files={"image": ("a.png", lens._tiny_png())})
+    assert file_response.status_code == 422
+    assert file_response.json()["error"]["code"] == "proxy_requires_image_url"
+    assert not called
+
+    monkeypatch.setattr(server, "download_image", lambda _url: lens._tiny_png())
+    links_response = await client.post("/v1/search", json={
+        "image_url": "https://img.example/a", "proxy": "vercel", "resolve_links": True,
+    })
+    assert links_response.status_code == 422
+    assert links_response.json()["error"]["code"] == "proxy_option_unsupported"
+    assert not called
+
+
+async def test_proxy_failure_is_returned_without_browser_fallback(client, monkeypatch):
+    def proxy_error(*args, **kwargs):
+        raise lens.LensProxyError("proxy_not_configured", "missing configuration")
+
+    monkeypatch.setattr(server, "download_image", lambda _url: lens._tiny_png())
+    monkeypatch.setattr(server, "_search_bytes", proxy_error)
+    response = await client.post("/v1/search", json={
+        "image_url": "https://img.example/a", "proxy": "vercel",
+    })
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "proxy_not_configured"
 
 
 async def test_requests_backend_searches_can_overlap(monkeypatch):
@@ -92,6 +130,7 @@ async def test_requests_backend_searches_can_overlap(monkeypatch):
     ({"json": {"image_url": "/etc/passwd"}}, 422),
     ({"json": {"image_url": "file:///etc/passwd"}}, 422),
     ({"json": {"image_url": "https://a.example", "backend": "browser"}}, 422),
+    ({"json": {"image_url": "https://a.example", "proxy": "arbitrary"}}, 422),
     ({"json": {"image_url": "http://a.example", "lang": "en\r\nX-Test"}}, 422),
     ({"data": {"image": "/tmp/photo"}}, 415),
     ({"files": {"image": ("a.png", b"not an image")}}, 415),

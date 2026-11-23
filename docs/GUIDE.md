@@ -456,6 +456,7 @@ Every knob is a **per-call argument**; environment variables just set the defaul
 | `max_titles` | `GLENS_MAX_TITLES` | `6` | Cap on `titles`. |
 | `timeout` | `GLENS_RESULT_TIMEOUT` | `25` | Browser-backend wait (seconds) for result tiles. |
 | `lang` | `GLENS_LANG` | *(none)* | Preferred response language (Accept-Language). |
+| `proxy` | — | `None` | Set to `"vercel"` to use the configured Vercel proxy. Requires a URL image input; no Chrome fallback. |
 | `use_cache` | `GLENS_CACHE` | off | Reuse recent results for the same image. |
 | — | `GLENS_CACHE_TTL` | `86400` | Cache entry lifetime (seconds). |
 | — | `GLENS_CACHE_DIR` | `~/.cache/glens/results` | Cache directory. |

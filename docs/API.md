@@ -63,6 +63,8 @@ glens.search(
     timeout: int | None = None,
     lang: str | None = None,
     use_cache: bool | None = None,
+    resolve_links: bool = False,
+    proxy: str | None = None,
 ) -> LensResult | None
 ```
 
@@ -81,6 +83,8 @@ Run one Google Lens pass on an image.
 | `timeout` | `int \| None` | `None` → `GLENS_RESULT_TIMEOUT` → `25` | Seconds the **browser** backend waits for result tiles to render. |
 | `lang` | `str \| None` | `None` → `GLENS_LANG` → *(none)* | Preferred response language, sent as `Accept-Language` on the fast path. Best-effort. Part of the cache key. |
 | `use_cache` | `bool \| None` | `None` → `GLENS_CACHE` → `False` | Read/write the local result cache. |
+| `resolve_links` | `bool` | `False` | Resolve Google redirect links. Unsupported with a proxy. |
+| `proxy` | `str \| None` | `None` | `"vercel"` uses the HTTPS endpoint configured by `GLENS_VERCEL_PROXY_URL`. Requires an existing Google cookie jar, skips the local result cache, and does not fall back to Chrome. |
 
 `0` is a meaningful value for `max_matches`/`max_titles`/`timeout` and is honored (it is **not** treated as "unset"); only `None` falls through to the env/default.
 
@@ -368,6 +372,8 @@ All are **defaults** overridden by explicit arguments. Precedence: **argument > 
 | `GLENS_CACHE` | flag | off | Default `use_cache`. Truthy = `1`/`true`/`yes`/`on`. |
 | `GLENS_CACHE_TTL` | int ≥ 1 | `86400` | Cache entry lifetime (seconds). |
 | `GLENS_CACHE_DIR` | path | `~/.cache/glens/results` | Result cache directory. |
+| `GLENS_VERCEL_PROXY_URL` | HTTPS URL | *(unset)* | Vercel Lens proxy route URL. |
+| `GLENS_VERCEL_PROXY_SECRET` | secret | *(unset)* | Must match the Vercel project's `CRON_SECRET`. |
 | `GLENS_HEADLESS` | flag | `1` (headless) | Bundled Chrome headless mode. **Setting it (to anything) also disables the visible-window gate-retry.** |
 | `GLENS_CHROME_PROFILE` | path | *(none)* | Persistent Chrome profile dir for `build_driver`. |
 

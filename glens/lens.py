@@ -50,8 +50,10 @@ import time
 import zlib
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from email.message import Message
 from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -155,6 +157,8 @@ _BARE_DOMAIN = re.compile(
 _EMBEDDED_URL = re.compile(r"\s*(?:https?://|www\.)\S*.*$", re.IGNORECASE)
 
 _browser_lock = threading.Lock()
+_VERCEL_PROXY_HEADER = "x-glens-proxy-upstream"
+_VERCEL_PROXY_BODY_LIMIT = 4 * 1024 * 1024
 
 
 class LensRateLimitError(RuntimeError):
@@ -163,6 +167,94 @@ class LensRateLimitError(RuntimeError):
     def __init__(self, retry_after: str | None = None):
         super().__init__("Google Lens rate limited the request.")
         self.retry_after = retry_after
+
+
+class LensProxyError(RuntimeError):
+    """A configured proxy failed before it returned a usable Lens response."""
+
+    def __init__(self, code: str, message: str, upstream_status: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.upstream_status = upstream_status
+
+
+class _VercelProxyAdapter(requests.adapters.BaseAdapter):
+    """Route one requests session's Google Lens traffic through a Vercel handler."""
+
+    def __init__(self, proxy_url: str, secret: str):
+        self.proxy_url = proxy_url
+        self.secret = secret
+        self.transport = requests.Session()
+        self.transport.trust_env = False
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        try:
+            target = urlparse(request.url)
+            # Accessing .port validates malformed port numbers before forwarding.
+            _ = target.port
+            if (target.scheme not in {"http", "https"} or not target.hostname
+                    or target.username or target.password):
+                raise LensProxyError("proxy_target_rejected", "Proxy target must be an HTTP(S) URL.")
+            body = request.body
+            if body is not None and not isinstance(body, bytes):
+                raise LensProxyError("proxy_request_invalid", "Proxy request body must be bytes.")
+            if body is not None and len(body) > _VERCEL_PROXY_BODY_LIMIT:
+                raise LensProxyError("proxy_request_too_large",
+                                     "The request exceeds the Vercel proxy size limit.")
+
+            headers = {
+                "Authorization": f"Bearer {self.secret}",
+                "X-Glens-Target-URL": request.url,
+                "X-Glens-Target-Method": request.method,
+            }
+            forwarded_headers = (
+                "accept", "accept-language", "content-type", "cookie", "origin", "referer",
+                "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-dest",
+                "sec-fetch-mode", "sec-fetch-site", "upgrade-insecure-requests", "user-agent",
+            )
+            for name in forwarded_headers:
+                value = request.headers.get(name)
+                if value is not None:
+                    headers[f"X-Glens-Forward-{name}"] = value
+
+            response = self.transport.post(self.proxy_url, data=body, headers=headers,
+                                           timeout=timeout or 30, allow_redirects=False)
+        except LensProxyError:
+            raise
+        except ValueError as exc:
+            raise LensProxyError("proxy_target_rejected",
+                                 "Proxy target must be a valid HTTP(S) URL.") from exc
+        except requests.RequestException as exc:
+            raise LensProxyError("proxy_unavailable", "The Vercel proxy request failed.") from exc
+
+        if response.headers.get(_VERCEL_PROXY_HEADER) != "1":
+            code = response.headers.get("x-glens-proxy-error", "proxy_unavailable")
+            raise LensProxyError(code, "The Vercel proxy could not forward the request.",
+                                 response.status_code)
+
+        result = requests.Response()
+        result.status_code = response.status_code
+        result.reason = response.reason
+        result.url = request.url
+        result.request = request
+        result.headers = response.headers.copy()
+        result._content = response.content
+        result._content_consumed = True
+        # requests.Session extracts cookies from response.raw rather than from
+        # response.headers. Recreate the small part of urllib3's response shape
+        # it needs so Google's Set-Cookie survives the upload redirect.
+        raw_headers = Message()
+        raw = getattr(response, "raw", None)
+        if raw is not None:
+            for cookie in raw.headers.getlist("Set-Cookie"):
+                raw_headers.add_header("Set-Cookie", cookie)
+        result.raw = SimpleNamespace(
+            _original_response=SimpleNamespace(msg=raw_headers) if raw_headers else None
+        )
+        return result
+
+    def close(self):
+        self.transport.close()
 
 
 @dataclass
@@ -629,8 +721,28 @@ def _ua_platform(user_agent: str) -> str:
     return "Windows"
 
 
-def _req_session(jar: dict, lang: str | None = None) -> requests.Session:
+def _req_session(jar: dict, lang: str | None = None,
+                 proxy: str | None = None) -> requests.Session:
     session = requests.Session()
+    if proxy is not None:
+        if proxy != "vercel":
+            session.close()
+            raise ValueError("proxy must be None or 'vercel'")
+        proxy_url = os.getenv("GLENS_VERCEL_PROXY_URL", "").strip()
+        proxy_secret = os.getenv("GLENS_VERCEL_PROXY_SECRET", "")
+        if not proxy_url or not proxy_secret:
+            session.close()
+            raise LensProxyError("proxy_not_configured",
+                                 "Vercel proxy URL and secret must be configured.")
+        parsed_proxy_url = urlparse(proxy_url)
+        if (parsed_proxy_url.scheme != "https" or not parsed_proxy_url.hostname
+                or parsed_proxy_url.username or parsed_proxy_url.password):
+            session.close()
+            raise LensProxyError("proxy_config_invalid",
+                                 "Vercel proxy URL must be an HTTPS URL.")
+        adapter = _VercelProxyAdapter(proxy_url, proxy_secret)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
     user_agent = jar.get("user_agent") or _REQ_UA_FALLBACK
     # Google fingerprints more than cookies: a bare header set gets the JS-gate
     # shell even with a fresh jar, while the browser's full header surface gets
@@ -816,6 +928,7 @@ def _parse_anchors_from_html(html: str) -> list[dict]:
 def _search_via_requests(
     frame_bytes: bytes, cookie_file: Path,
     lang: str | None = None,
+    proxy: str | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """Both Lens legs over plain requests, riding the browser-minted cookie jar.
 
@@ -826,9 +939,13 @@ def _search_via_requests(
     """
     jar = _load_cookie_jar(cookie_file)
     if jar is None:
+        if proxy is not None:
+            raise LensProxyError("proxy_cookie_missing",
+                                 "A browser-minted Google session is required for proxy searches.")
         logger.info("glens req backend: no cookie jar yet; using the browser to mint one.")
         return None, None
-    session = _req_session(jar, lang=lang)
+    session = (_req_session(jar, lang=lang) if proxy is None
+               else _req_session(jar, lang=lang, proxy=proxy))
     last_exc: Exception | None = None
     # Bound before the loop: the HTTPError handler reports it, and the upload
     # itself can fail before we ever learn where it would have landed.
@@ -882,20 +999,44 @@ def _search_via_requests(
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 429:
                 session.close()
+                if proxy is not None and exc.response.headers.get(_VERCEL_PROXY_HEADER) != "1":
+                    raise LensProxyError(
+                        "proxy_upstream_unmarked",
+                        "The proxy returned an unverified 429 response.",
+                        429,
+                    ) from exc
                 raise LensRateLimitError(exc.response.headers.get("Retry-After")) from exc
+            if proxy is not None:
+                session.close()
+                status_code = exc.response.status_code if exc.response is not None else None
+                raise LensProxyError(
+                    "upstream_rejected",
+                    "Google Lens rejected the proxied request.",
+                    status_code,
+                ) from exc
             # A hard status is deterministic, not transient: retrying re-uploads
             # the image to an endpoint that just refused it. Fall back
             # now so the browser can re-mint the jar.
             logger.info("glens req backend: HTTP error (%s); falling back to the browser.", exc)
             session.close()
             return None, results_url
+        except LensProxyError:
+            session.close()
+            raise
         except requests.RequestException as exc:
+            if proxy is not None:
+                session.close()
+                raise LensProxyError("proxy_unavailable",
+                                     "The proxied Lens request failed.") from exc
             last_exc = exc
             logger.info("glens req backend attempt %d/%d failed (%s).",
                         attempt, _REQ_ATTEMPTS, exc)
     logger.info("glens req backend gave up after %d attempts (%s); falling back to the browser.",
                 _REQ_ATTEMPTS, last_exc)
     session.close()
+    if proxy is not None:
+        raise LensProxyError("proxy_lookup_failed",
+                             "Vercel proxy did not return usable Lens results.")
     return None, None
 
 
@@ -1240,6 +1381,7 @@ def search(
     lang: str | None = None,
     use_cache: bool | None = None,
     resolve_links: bool = False,
+    proxy: str | None = None,
 ) -> LensResult | None:
     """Run one Google Lens pass on an image.
 
@@ -1264,6 +1406,9 @@ def search(
         resolve_links: resolve Google's temporary ``/goto`` wrappers to merchant
             URLs. This uses the saved Google session and is slower, so it defaults
             to False.
+        proxy: optionally route the requests backend through the configured
+            ``"vercel"`` proxy. Proxy lookups bypass the local cache and never
+            fall back to Chrome.
 
     Returns a ``LensResult`` or ``None`` when the lookup fails. Never raises for
     ordinary network/parse failures; an unknown ``backend`` raises ``ValueError``
@@ -1290,7 +1435,7 @@ def search(
     result = _search_bytes(frame_bytes, backend=backend, driver_factory=driver_factory,
                            cookie_file=cookie_file, max_matches=max_matches, max_titles=max_titles,
                            timeout=timeout, lang=lang, use_cache=use_cache,
-                           resolve_links=resolve_links)
+                           resolve_links=resolve_links, proxy=proxy)
     return result or None
 
 
@@ -1299,12 +1444,22 @@ def _search_bytes(
     cookie_file: str | os.PathLike | None = None, max_matches: int | None = None,
     max_titles: int | None = None, timeout: int | None = None, lang: str | None = None,
     use_cache: bool | None = None, resolve_links: bool = False,
-    raise_on_rate_limit: bool = False,
+    raise_on_rate_limit: bool = False, proxy: str | None = None,
+    raise_on_proxy_error: bool = False,
 ) -> LensResult | None:
     """Return None for inconclusive lookups and an empty LensResult for confirmed misses."""
+    backend_setting = backend
     backend = (backend or "").strip().lower() or DEFAULT_BACKEND
     if backend not in _VALID_BACKENDS:
         raise ValueError(f"backend must be one of {_VALID_BACKENDS!r}, not {backend!r}")
+    if proxy not in (None, "vercel"):
+        raise ValueError("proxy must be None or 'vercel'")
+    if proxy is not None and backend == "browser" and backend_setting is not None:
+        raise ValueError("proxy searches require the requests backend")
+    if proxy is not None:
+        # An explicit proxy request uses requests even if the process default is
+        # browser; only an explicit per-call browser backend is incompatible.
+        backend = "req"
     max_matches = DEFAULT_MAX_MATCHES if max_matches is None else max_matches
     max_titles = DEFAULT_MAX_TITLES if max_titles is None else max_titles
     timeout = DEFAULT_RESULT_TIMEOUT if timeout is None else timeout
@@ -1319,7 +1474,7 @@ def _search_bytes(
     items: list[dict] | None = None
     results_url: str | None = None
     cache_hit = False
-    cache_key = _cache_key(frame_bytes, lang) if use_cache else None
+    cache_key = _cache_key(frame_bytes, lang) if use_cache and proxy is None else None
     if cache_key and backend != "browser":
         # An explicit browser run is also how the cookie jar gets re-minted;
         # never let a cache hit silently skip that side effect.
@@ -1330,12 +1485,26 @@ def _search_bytes(
 
     if items is None and backend in ("auto", "req"):
         try:
-            items, results_url = _search_via_requests(frame_bytes, cookie_path, lang)
+            if proxy is None:
+                items, results_url = _search_via_requests(frame_bytes, cookie_path, lang)
+            else:
+                items, results_url = _search_via_requests(frame_bytes, cookie_path, lang,
+                                                          proxy=proxy)
         except LensRateLimitError:
             if raise_on_rate_limit:
                 raise
             logger.info("glens req backend received an upstream rate limit.")
             return None
+        except LensProxyError:
+            if raise_on_proxy_error:
+                raise
+            logger.info("glens proxy search failed.")
+            return None
+    if items is None and proxy is not None:
+        if raise_on_proxy_error:
+            raise LensProxyError("proxy_lookup_failed",
+                                 "Vercel proxy did not return usable Lens results.")
+        return None
     if items is None and backend in ("auto", "browser"):
         # Keep browser use single-filed because it may share a persistent Chrome
         # profile and refresh the cookie jar. Request-backed searches can overlap.

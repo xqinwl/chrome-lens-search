@@ -9,10 +9,11 @@ from urllib.parse import urljoin
 
 import certifi
 import urllib3
-from PIL import Image
+from PIL import Image, ImageOps
 from urllib3.util import parse_url
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_PROXY_IMAGE_BYTES = 3_500 * 1024
 _REDIRECTS = {301, 302, 303, 307, 308}
 
 
@@ -37,6 +38,38 @@ def validate_image(data: bytes) -> None:
             picture.verify()
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
         raise APIError(415, "invalid_image", "Expected a readable image file.") from exc
+
+
+def compress_image_for_proxy(data: bytes) -> bytes:
+    """Keep proxy multipart uploads below Vercel's 4.5 MB request limit."""
+    if len(data) <= MAX_PROXY_IMAGE_BYTES:
+        return data
+    try:
+        with Image.open(BytesIO(data)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.load()
+            if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise APIError(415, "invalid_image", "Expected a readable image file.") from exc
+
+    for scale in (1.0, 0.8, 0.65, 0.5, 0.35, 0.2):
+        size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+        resized = image if size == image.size else image.resize(size, Image.Resampling.LANCZOS)
+        for quality in (86, 76, 66, 56, 46, 36, 26):
+            output = BytesIO()
+            resized.save(output, format="JPEG", quality=quality, optimize=True)
+            compressed = output.getvalue()
+            if len(compressed) <= MAX_PROXY_IMAGE_BYTES:
+                return compressed
+
+    raise APIError(413, "proxy_image_too_large",
+                   "The image could not be compressed to the Vercel proxy size limit.")
 
 
 def _public_address(value: str) -> bool:

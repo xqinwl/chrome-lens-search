@@ -2,6 +2,9 @@ services:
   glens:
     build: .
     init: true
+    environment:
+      GLENS_VERCEL_PROXY_URL: ${GLENS_VERCEL_PROXY_URL:-}
+      GLENS_VERCEL_PROXY_SECRET: ${GLENS_VERCEL_PROXY_SECRET:-}
     ports:
       - "127.0.0.1:${GLENS_PORT:-8000}:8000"
     volumes:

@@ -13,6 +13,7 @@ env/
 .cache/
 *_cookies.json
 cookies.json
+.env
 
 # Private maintainer notes (never publish)
 *.private.md

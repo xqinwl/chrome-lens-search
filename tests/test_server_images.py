@@ -64,3 +64,21 @@ def test_dns_failure(monkeypatch):
         images.download_image("https://example.com/a")
     assert exc.value.status == 502
     assert exc.value.code == "image_download_failed"
+
+
+def test_compress_image_for_proxy_keeps_payload_within_budget():
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    raw = Image.frombytes("RGB", (2000, 2000), os.urandom(12_000_000))
+    output = BytesIO()
+    raw.save(output, format="PNG")
+    source = output.getvalue()
+    assert len(source) > images.MAX_PROXY_IMAGE_BYTES
+
+    compressed = images.compress_image_for_proxy(source)
+    assert len(compressed) <= images.MAX_PROXY_IMAGE_BYTES
+    with Image.open(BytesIO(compressed)) as result:
+        assert result.format == "JPEG"

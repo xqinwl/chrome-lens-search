@@ -65,6 +65,8 @@ If Docker DNS returns a Clash fake IP such as `198.18.x.x` for an image host, co
 
 The requests backend can run independent searches in parallel, with no extra API-level concurrency limit; actual throughput depends on the Python worker pool and available resources. Browser fallbacks and session refreshes are serialized to protect the shared Chrome profile and cookie jar. Errors use `{"error":{"code":"…","message":"…"}}`. HTTP 413 means too large, 415 unsupported content, and 422 invalid input. HTTP 429 `upstream_rate_limited` means Google Lens explicitly returned 429 (and includes `Retry-After` when Google sends it). HTTP 502 distinguishes image download failures (`image_download_failed`) from an inconclusive Lens lookup (`lens_lookup_failed`).
 
+To use the Vercel proxy, set `GLENS_VERCEL_PROXY_URL` and `GLENS_VERCEL_PROXY_SECRET`, then include `"proxy":"vercel"` in a JSON request. Proxy mode accepts `image_url` only, requires an existing Google cookie jar, skips the local result cache, and returns a proxy error without falling back to Chrome. Oversized images are recompressed to fit Vercel's request budget. Set the secret to the same value as the Vercel project's `CRON_SECRET`.
+
 To serve directly from a checkout, install `pip install ".[server,browser]"` and run `glens serve`. The default is `127.0.0.1:8000`; use `--host` and `--port` to change it.
 
 If a URL returns `422 invalid_image_url`, check that the hostname and every redirect resolve to public IP addresses. A `502 image_download_failed` means the URL host could not serve the image. A `502 lens_lookup_failed` with `req_ready: false` after cold start means no usable Lens session was established. Run `docker compose exec glens glens warmup -v` to inspect the browser step.
