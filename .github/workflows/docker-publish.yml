@@ -1,0 +1,125 @@
+name: Publish Docker Image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to publish (e.g. v1.0.2); leave empty to use sha-<short>"
+        required: false
+        default: ""
+      platforms:
+        description: "Target platforms (comma-separated)"
+        required: false
+        default: "linux/amd64"
+      push_latest:
+        description: "Also update :latest tag"
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Hub secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::Missing DOCKERHUB_USERNAME or DOCKERHUB_TOKEN repository secrets."
+            exit 1
+          fi
+
+      - name: Compute image metadata
+        id: meta
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
+          INPUT_PUSH_LATEST: ${{ inputs.push_latest }}
+        run: |
+          IMAGE="${DOCKERHUB_USERNAME}/chrome-lens-search"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            PLATFORMS="linux/amd64"
+            PUSH_LATEST="true"
+            if [[ "$VERSION" == *-* ]]; then
+              PUSH_LATEST="false"
+            fi
+          else
+            VERSION="${INPUT_TAG}"
+            PLATFORMS="${INPUT_PLATFORMS:-linux/amd64}"
+            PUSH_LATEST="${INPUT_PUSH_LATEST:-true}"
+          fi
+
+          TAGS="${IMAGE}:sha-${SHORT_SHA}"
+          if [[ -n "$VERSION" ]]; then
+            TAGS="${IMAGE}:${VERSION}"$'\n'"${TAGS}"
+          fi
+          if [[ "$PUSH_LATEST" == "true" ]]; then
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+          fi
+
+          {
+            echo "image=${IMAGE}"
+            echo "version=${VERSION:-sha-${SHORT_SHA}}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "build_date=${BUILD_DATE}"
+            echo "platforms=${PLATFORMS}"
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        if: contains(steps.meta.outputs.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ steps.meta.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.short_sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sync DOCKERHUB.md to Docker Hub Overview
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          python3 scripts/sync-dockerhub-readme.py "${{ steps.meta.outputs.image }}" DOCKERHUB.md
