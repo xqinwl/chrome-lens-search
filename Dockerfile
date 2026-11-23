@@ -1,7 +1,7 @@
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium chromium-driver ca-certificates xvfb xauth \
+    && apt-get install -y --no-install-recommends chromium chromium-driver ca-certificates xvfb xauth tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 glens \
     && install -d -o glens -g glens /data /data/logs \
@@ -29,5 +29,5 @@ USER glens
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s \
     CMD ["python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/healthz', timeout=2).close()"]
-ENTRYPOINT ["xvfb-run", "-a"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "-g", "--", "xvfb-run", "-a"]
 CMD ["glens", "serve", "--host", "0.0.0.0", "--port", "8000"]
