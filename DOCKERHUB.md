@@ -159,6 +159,8 @@ curl -i -X POST http://127.0.0.1:8000/v1/search \
 | `GLENS_VERCEL_PROXY_URL` / `GLENS_VERCEL_PROXY_URLS` | *(empty)* | Single or comma-separated Vercel proxy HTTPS URLs |
 | `GLENS_VERCEL_PROXY_SECRET` / `GLENS_VERCEL_PROXY_SECRETS` | *(empty)* | Shared secret(s) matching Vercel `CRON_SECRET` |
 | `GLENS_PROXY_FALLBACK` | `1` | Automatically fail over / load-share from Vercel to local slots |
+| `GLENS_AUTO_WARMUP` | `1` (image) / `0` (lib) | Background proactive cookie warmup on startup and periodic zero-downtime renewal |
+| `GLENS_AUTO_WARMUP_INTERVAL` | `14400` | Proactive cookie refresh interval in seconds (default 4h, min 300s) |
 | `GLENS_VERCEL_RPM` | `50` (Compose) / `20` (image) | Per-slot RPM limit for Vercel slots (`0` = unlimited) |
 | `GLENS_LOCAL_RPM` | `30` (Compose) / `15` (image) | Per-slot RPM limit for local slots (`0` = unlimited) |
 | `GLENS_SLOT_MIN_INTERVAL` | `0.3` (Compose) / `0.5` (image) | Minimum spacing between requests per slot (seconds) |

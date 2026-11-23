@@ -35,6 +35,7 @@ _CHALLENGE_BACKOFF_SECONDS = (120.0, 300.0, 900.0)
 _RATE_LIMIT_BACKOFF_SECONDS = (60.0, 180.0, 600.0)
 _TRANSIENT_COOLDOWN_SECONDS = 30.0
 _MAX_SPACING_WAIT_SECONDS = 2.5
+_AUTO_WARMUP_MAX_BACKOFF_SECONDS = 1800.0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -227,8 +228,27 @@ class RouteSlot:
             self.challenge_streak = 0
             self.rate_limit_streak = 0
 
+    def reset_cooldown_if_reason(self, reasons: tuple[str, ...]) -> bool:
+        """Atomically clear cooldown only if currently cooling down for one of ``reasons``."""
+        with self._lock:
+            if self.state == "cooldown" and self.cooldown_reason in reasons:
+                self.state = "healthy"
+                self.cooldown_until = 0.0
+                self.cooldown_reason = None
+                self.challenge_streak = 0
+                self.rate_limit_streak = 0
+                return True
+            return False
+
     def status_dict(self, now: float | None = None) -> dict:
         now = time.time() if now is None else now
+        jar = lens_mod._load_cookie_jar(self.cookie_file)
+        cookie_age: float | None = None
+        if jar is not None and jar.get("minted_at") is not None:
+            try:
+                cookie_age = round(max(0.0, now - float(jar["minted_at"])), 1)
+            except (TypeError, ValueError):
+                cookie_age = None
         with self._lock:
             state = self._refresh_state_locked(now)
             self._prune_locked(now)
@@ -245,7 +265,8 @@ class RouteSlot:
                 "challenge_count": self.challenge_count,
                 "rate_limit_count": self.rate_limit_count,
                 "error_count": self.error_count,
-                "cookie_ready": lens_mod._load_cookie_jar(self.cookie_file) is not None,
+                "cookie_ready": jar is not None,
+                "cookie_age_seconds": cookie_age,
             }
 
 
@@ -267,6 +288,11 @@ class RoutePool:
         jitter_seconds: float | None = None,
         clock: Callable[[], float] | None = None,
         sleeper: Callable[[float], None] | None = None,
+        auto_warmup: bool | None = None,
+        auto_warmup_interval: int | None = None,
+        auto_warmup_check_interval: int | None = None,
+        auto_warmup_startup_jitter: float | None = None,
+        auto_warmup_retry_base: float | None = None,
     ) -> None:
         self.slots = list(slots)
         self.base_cookie_file = base_cookie_file or lens_mod._default_cookie_file()
@@ -281,6 +307,38 @@ class RoutePool:
         self._clock = clock or time.time
         self._sleep = sleeper or time.sleep
         self._inflight = cache_mod.InFlightCoordinator()
+
+        self.auto_warmup_enabled = (
+            _env_flag("GLENS_AUTO_WARMUP", False)
+            if auto_warmup is None else auto_warmup
+        )
+        self.auto_warmup_interval = (
+            _env_int("GLENS_AUTO_WARMUP_INTERVAL", 14400, minimum=300)
+            if auto_warmup_interval is None else max(1, int(auto_warmup_interval))
+        )
+        self.auto_warmup_check_interval = (
+            _env_int("GLENS_AUTO_WARMUP_CHECK_INTERVAL", 60, minimum=5)
+            if auto_warmup_check_interval is None else max(1, int(auto_warmup_check_interval))
+        )
+        self.auto_warmup_startup_jitter = (
+            _env_float("GLENS_AUTO_WARMUP_STARTUP_JITTER", 5.0, minimum=0.0)
+            if auto_warmup_startup_jitter is None else max(0.0, float(auto_warmup_startup_jitter))
+        )
+        self.auto_warmup_retry_base = (
+            _env_float("GLENS_AUTO_WARMUP_RETRY_BASE", 60.0, minimum=5.0)
+            if auto_warmup_retry_base is None else max(1.0, float(auto_warmup_retry_base))
+        )
+        self._auto_warmup_lock = threading.Lock()
+        self._auto_warmup_stop = threading.Event()
+        self._auto_warmup_thread: threading.Thread | None = None
+        self._auto_warmup_runs = 0
+        self._auto_warmup_success = 0
+        self._auto_warmup_failure = 0
+        self._auto_warmup_last_run_at: float | None = None
+        self._auto_warmup_last_ok: bool | None = None
+        self._auto_warmup_last_reason: str | None = None
+        self._slot_warmup_failures: dict[str, int] = {}
+        self._slot_warmup_next_retry: dict[str, float] = {}
 
     @classmethod
     def from_env(cls, *, base_cookie_file: Path | None = None) -> RoutePool:
@@ -449,15 +507,10 @@ class RoutePool:
                 else:
                     slot.last_refresh_failed_at = 0.0
                     # Sync freshly minted cookies to Vercel slots and release stale-jar cooldowns.
-                    synced = 0
-                    for other in self.slots:
-                        if other.kind == "vercel":
-                            lens_mod._ensure_route_cookie_file(
-                                other.cookie_file, self.base_cookie_file
-                            )
-                            synced += 1
-                            if other.cooldown_reason == "proxy_lookup_failed":
-                                other.reset_cooldown()
+                    synced = (
+                        self._sync_vercel_slots_from_base()
+                        if slot.cookie_file == self.base_cookie_file else 0
+                    )
                     logger.info(
                         "glens pool: slot %s Chromium cookie refresh succeeded in %.2fs "
                         "(synced %d vercel slot(s)).",
@@ -703,6 +756,40 @@ class RoutePool:
             lens_mod._cache_write(c_key, items, results_url, dhash=dhash, lang=lang)
         return shaped, route_id
 
+    def _sync_vercel_slots_from_base(self) -> int:
+        """Atomically copy a freshly minted base cookie jar to every Vercel slot."""
+        synced = 0
+        for other in self.slots:
+            if other.kind != "vercel":
+                continue
+            before_stamp = lens_mod._jar_stamp(other.cookie_file)
+            lens_mod._ensure_route_cookie_file(other.cookie_file, self.base_cookie_file)
+            after_stamp = lens_mod._jar_stamp(other.cookie_file)
+            if after_stamp is None:
+                continue
+            if after_stamp != before_stamp:
+                synced += 1
+                other.reset_cooldown_if_reason(("proxy_cookie_missing", "proxy_lookup_failed"))
+            else:
+                other.reset_cooldown_if_reason(("proxy_cookie_missing",))
+        return synced
+
+    def _classify_auto_warmup_need(
+        self, slot: RouteSlot, now: float,
+    ) -> tuple[str | None, bool, bool]:
+        """Return ``(reason, force, mark_refreshing)`` for a local slot."""
+        jar = lens_mod._load_cookie_jar(slot.cookie_file)
+        if jar is None:
+            return "cookie_missing", False, True
+        minted_at = jar.get("minted_at")
+        try:
+            age = max(0.0, now - float(minted_at)) if minted_at is not None else 0.0
+        except (TypeError, ValueError):
+            age = float(self.auto_warmup_interval)
+        if age >= self.auto_warmup_interval:
+            return "cookie_stale", True, False
+        return None, False, False
+
     def warmup(
         self,
         *,
@@ -722,23 +809,243 @@ class RoutePool:
             if reset_cooldown:
                 slot.reset_cooldown()
             if slot.kind == "local":
-                ok = lens_mod.warmup(
-                    cookie_file=slot.cookie_file,
-                    driver_factory=self._make_driver_factory(slot),
-                    force=force,
-                )
+                with slot.refresh_lock:
+                    ok = lens_mod.warmup(
+                        cookie_file=slot.cookie_file,
+                        driver_factory=self._make_driver_factory(slot),
+                        force=force,
+                    )
+                if ok:
+                    with self._auto_warmup_lock:
+                        self._slot_warmup_failures.pop(slot.slot_id, None)
+                        self._slot_warmup_next_retry.pop(slot.slot_id, None)
                 results[slot.slot_id] = {"ok": ok, "state": slot.effective_state(self._clock())}
             else:
-                # Re-seed Vercel cookie file from the base local jar when forced.
-                if force and slot.cookie_file.exists():
-                    try:
-                        slot.cookie_file.unlink()
-                    except OSError:
-                        pass
+                # Atomically sync Vercel cookie file from the base local jar without
+                # deleting an existing valid jar if local warmup failed.
                 lens_mod._ensure_route_cookie_file(slot.cookie_file, self.base_cookie_file)
                 ready = lens_mod._load_cookie_jar(slot.cookie_file) is not None
                 results[slot.slot_id] = {"ok": ready, "state": slot.effective_state(self._clock())}
         return {"slots": results}
+
+    def run_auto_warmup_once(self) -> dict[str, str]:
+        """Inspect local slots and proactively mint/renew cookies when needed.
+
+        * Missing jar (cold start): acquires ``refresh_lock`` and marks the slot
+          ``refreshing`` so concurrent requests ride the startup mint.
+        * Stale jar (``age >= auto_warmup_interval``): acquires ``refresh_lock``
+          WITHOUT marking ``refreshing``, so live traffic keeps using the valid
+          jar on disk at full speed until the new jar is atomically swapped in.
+        """
+        outcomes: dict[str, str] = {}
+        local_slots = [s for s in self.slots if s.kind == "local"]
+        for slot in local_slots:
+            if self._auto_warmup_stop.is_set():
+                break
+            now = self._clock()
+            state = slot.effective_state(now)
+            if state == "refreshing":
+                outcomes[slot.slot_id] = "skipped_refreshing"
+                continue
+            if state == "cooldown":
+                outcomes[slot.slot_id] = "skipped_cooldown"
+                continue
+
+            with self._auto_warmup_lock:
+                next_retry = self._slot_warmup_next_retry.get(slot.slot_id, 0.0)
+            if now < next_retry:
+                outcomes[slot.slot_id] = "skipped_backoff"
+                continue
+
+            reason, force, mark_refreshing = self._classify_auto_warmup_need(slot, now)
+            if reason is None:
+                # Cookie is fresh; still ensure Vercel slots are seeded from base jar.
+                if slot.cookie_file == self.base_cookie_file:
+                    self._sync_vercel_slots_from_base()
+                outcomes[slot.slot_id] = "fresh"
+                continue
+
+            if not slot.refresh_lock.acquire(blocking=False):
+                outcomes[slot.slot_id] = "skipped_busy"
+                continue
+
+            t0 = self._clock()
+            ok = False
+            hit_challenge = False
+            challenge_cooldown = 0.0
+            skipped_outcome: str | None = None
+            try:
+                # Double-check state & cookie freshness under refresh_lock to avoid
+                # redundant Chromium launches if a live request just refreshed or cooled down.
+                state_after_lock = slot.effective_state(t0)
+                if state_after_lock == "cooldown":
+                    skipped_outcome = "skipped_cooldown"
+                else:
+                    reason, force, mark_refreshing = self._classify_auto_warmup_need(slot, t0)
+                    if reason is None:
+                        skipped_outcome = "fresh"
+
+                if skipped_outcome is None:
+                    if mark_refreshing:
+                        slot.set_refreshing(True)
+                    logger.info(
+                        "glens auto-warmup: slot=%s start reason=%s force=%s",
+                        slot.slot_id, reason, force,
+                    )
+                    try:
+                        ok = lens_mod.warmup(
+                            cookie_file=slot.cookie_file,
+                            driver_factory=self._make_driver_factory(slot),
+                            force=force,
+                            raise_on_bot_challenge=True,
+                        )
+                    except lens_mod.LensBotChallengeError:
+                        hit_challenge = True
+                        challenge_cooldown = slot.mark_bot_challenge(self._clock())
+                        ok = False
+                    except Exception as exc:
+                        logger.warning(
+                            "glens auto-warmup: slot=%s unexpected error: %s",
+                            slot.slot_id, exc,
+                        )
+                        ok = False
+            finally:
+                if mark_refreshing and skipped_outcome is None:
+                    slot.set_refreshing(False)
+                slot.refresh_lock.release()
+
+            if skipped_outcome is not None:
+                if skipped_outcome == "fresh" and slot.cookie_file == self.base_cookie_file:
+                    self._sync_vercel_slots_from_base()
+                outcomes[slot.slot_id] = skipped_outcome
+                continue
+
+            end_now = self._clock()
+            duration_s = max(0.0, end_now - t0)
+            synced = (
+                self._sync_vercel_slots_from_base()
+                if (ok and slot.cookie_file == self.base_cookie_file) else 0
+            )
+
+            with self._auto_warmup_lock:
+                self._auto_warmup_runs += 1
+                self._auto_warmup_last_run_at = end_now
+                self._auto_warmup_last_ok = ok
+                self._auto_warmup_last_reason = reason
+                if ok:
+                    self._auto_warmup_success += 1
+                    self._slot_warmup_failures.pop(slot.slot_id, None)
+                    self._slot_warmup_next_retry.pop(slot.slot_id, None)
+                    backoff_s = 0.0
+                    failures = 0
+                else:
+                    self._auto_warmup_failure += 1
+                    failures = self._slot_warmup_failures.get(slot.slot_id, 0) + 1
+                    self._slot_warmup_failures[slot.slot_id] = failures
+                    backoff_s = min(
+                        _AUTO_WARMUP_MAX_BACKOFF_SECONDS,
+                        self.auto_warmup_retry_base * (2 ** (failures - 1)),
+                    )
+                    self._slot_warmup_next_retry[slot.slot_id] = end_now + backoff_s
+
+            if ok:
+                logger.info(
+                    "glens auto-warmup: slot=%s ok=True reason=%s duration=%.2fs "
+                    "synced_vercel=%d",
+                    slot.slot_id, reason, duration_s, synced,
+                )
+                outcomes[slot.slot_id] = f"ok:{reason}"
+            elif hit_challenge:
+                logger.warning(
+                    "glens auto-warmup: slot=%s ok=False reason=%s bot_challenge "
+                    "duration=%.2fs slot_cooldown=%.0fs failures=%d next_retry_in=%.0fs",
+                    slot.slot_id, reason, duration_s, challenge_cooldown, failures, backoff_s,
+                )
+                outcomes[slot.slot_id] = f"bot_challenge:{reason}"
+            else:
+                logger.warning(
+                    "glens auto-warmup: slot=%s ok=False reason=%s duration=%.2fs "
+                    "failures=%d next_retry_in=%.0fs",
+                    slot.slot_id, reason, duration_s, failures, backoff_s,
+                )
+                outcomes[slot.slot_id] = f"failed:{reason}"
+
+        return outcomes
+
+    def _auto_warmup_loop(self) -> None:
+        jitter = (
+            random.uniform(0.0, self.auto_warmup_startup_jitter)
+            if self.auto_warmup_startup_jitter > 0 else 0.0
+        )
+        if jitter > 0 and self._auto_warmup_stop.wait(jitter):
+            return
+        while not self._auto_warmup_stop.is_set():
+            try:
+                self.run_auto_warmup_once()
+            except Exception as exc:
+                logger.warning("glens auto-warmup: loop error: %s", exc)
+            if self._auto_warmup_stop.wait(self.auto_warmup_check_interval):
+                break
+
+    def start_auto_warmup(self) -> bool:
+        """Start the background proactive cookie warmup daemon thread."""
+        with self._auto_warmup_lock:
+            if not self.auto_warmup_enabled:
+                return False
+            if self._auto_warmup_thread is not None and self._auto_warmup_thread.is_alive():
+                return True
+            self._auto_warmup_stop.clear()
+            thread = threading.Thread(
+                target=self._auto_warmup_loop,
+                name="glens-auto-warmup",
+                daemon=True,
+            )
+            self._auto_warmup_thread = thread
+            thread.start()
+        logger.info(
+            "glens auto-warmup: started (interval=%ds check=%ds jitter=%.1fs).",
+            self.auto_warmup_interval,
+            self.auto_warmup_check_interval,
+            self.auto_warmup_startup_jitter,
+        )
+        return True
+
+    def stop_auto_warmup(self, timeout: float = 2.0) -> None:
+        """Signal the background warmup worker to stop and wait briefly."""
+        with self._auto_warmup_lock:
+            thread = self._auto_warmup_thread
+            self._auto_warmup_stop.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        with self._auto_warmup_lock:
+            if self._auto_warmup_thread is thread and not (thread and thread.is_alive()):
+                self._auto_warmup_thread = None
+
+    def auto_warmup_status(self, now: float | None = None) -> dict:
+        now = self._clock() if now is None else now
+        with self._auto_warmup_lock:
+            running = (
+                self._auto_warmup_thread is not None and self._auto_warmup_thread.is_alive()
+            )
+            max_failures = max(self._slot_warmup_failures.values(), default=0)
+            next_retry = max(
+                (max(0.0, ts - now) for ts in self._slot_warmup_next_retry.values()),
+                default=0.0,
+            )
+            return {
+                "enabled": self.auto_warmup_enabled,
+                "running": running,
+                "interval_seconds": self.auto_warmup_interval,
+                "check_interval_seconds": self.auto_warmup_check_interval,
+                "runs_total": self._auto_warmup_runs,
+                "success_total": self._auto_warmup_success,
+                "failure_total": self._auto_warmup_failure,
+                "consecutive_failures": max_failures,
+                "last_run_at": self._auto_warmup_last_run_at,
+                "last_ok": self._auto_warmup_last_ok,
+                "last_reason": self._auto_warmup_last_reason,
+                "next_retry_in_seconds": round(next_retry, 1),
+            }
 
     def status(self) -> dict:
         now = self._clock()
@@ -746,4 +1053,5 @@ class RoutePool:
             "proxy_fallback": self.proxy_fallback,
             "routes": [slot.status_dict(now) for slot in self.slots],
             "cache_stats": cache_mod.stats.snapshot(),
+            "auto_warmup": self.auto_warmup_status(now),
         }

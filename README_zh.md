@@ -366,6 +366,8 @@ for path in my_images:
 | — | `GLENS_VERCEL_PROXY_URL` / `GLENS_VERCEL_PROXY_URLS` | *(空)* | 单个或多个逗号分隔的 Vercel 代理 HTTPS 地址 |
 | — | `GLENS_VERCEL_PROXY_SECRET` / `GLENS_VERCEL_PROXY_SECRETS` | *(空)* | Vercel 代理鉴权密钥（与 Vercel 侧 `CRON_SECRET` 一致） |
 | — | `GLENS_PROXY_FALLBACK` | `1` | Vercel 限流/异常/冷却时是否自动分流降级到本地通道 |
+| — | `GLENS_AUTO_WARMUP` | `1` (Docker) / `0` (代码默认) | 后台自动预热：启动冷启动补齐 Cookie 并按周期静默无感续期 |
+| — | `GLENS_AUTO_WARMUP_INTERVAL` | `14400` | 后台静默续期周期（秒，默认 4 小时，最小 300 秒） |
 | — | `GLENS_VERCEL_RPM` | `50` (Compose) / `20` (代码默认) | 单个 Vercel 槽位每分钟最大请求数（`0` 为不限） |
 | — | `GLENS_LOCAL_RPM` | `30` (Compose) / `15` (代码默认) | 单个本地槽位每分钟最大请求数（`0` 为不限） |
 | — | `GLENS_SLOT_MIN_INTERVAL` | `0.3` (Compose) / `0.5` (代码默认) | 单槽位两次请求之间的最小间隔（秒） |

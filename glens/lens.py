@@ -2011,6 +2011,7 @@ def warmup(
     driver_factory: Callable | None = None,
     timeout: int | None = None,
     force: bool = False,
+    raise_on_bot_challenge: bool = False,
 ) -> bool:
     """Mint (or refresh) the session jar with one browser run, so subsequent
     lookups run over plain HTTP. The deploy-time counterpart of ``search()``:
@@ -2057,6 +2058,8 @@ def warmup(
             _search_via_browser(frame_bytes, cookie_path, timeout or 10, driver_factory)
     except LensBotChallengeError:
         logger.warning("glens: warmup hit a Google bot challenge; skipping retry.")
+        if raise_on_bot_challenge:
+            raise
         return False
     after = _jar_stamp(cookie_path)
     if after is None:

@@ -60,7 +60,10 @@ def reset_pool(pool: RoutePool | None = None) -> None:
     """Replace or clear the process-wide route pool (handy for tests and reloads)."""
     global _route_pool
     with _pool_lock:
+        previous = _route_pool
         _route_pool = pool
+    if previous is not None and previous is not pool:
+        previous.stop_auto_warmup()
 
 
 class _SearchPayload(dict):
@@ -238,11 +241,19 @@ def create_app() -> FastAPI:
             f"{s.slot_id}({s.kind}:rpm={s.rpm_limit})" for s in pool.slots
         )
         logger.info(
-            "glens server startup: slots=[%s] proxy_fallback=%s",
-            slot_summary, pool.proxy_fallback,
+            "glens server startup: slots=[%s] proxy_fallback=%s auto_warmup=%s interval=%ds",
+            slot_summary,
+            pool.proxy_fallback,
+            pool.auto_warmup_enabled,
+            pool.auto_warmup_interval,
         )
-        yield
-        logger.info("glens server shutdown.")
+        if pool.auto_warmup_enabled:
+            pool.start_auto_warmup()
+        try:
+            yield
+        finally:
+            pool.stop_auto_warmup()
+            logger.info("glens server shutdown.")
 
     app = FastAPI(title="glens", version="1", lifespan=_lifespan)
 

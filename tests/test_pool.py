@@ -300,5 +300,253 @@ async def test_server_exposes_route_header_bot_challenge_503_pool_status_and_war
             assert warmed.status_code == 200
             assert warmed.json()["slots"]["local-0"]["state"] == "healthy"
             assert warmed.json()["slots"]["vercel-0"]["state"] == "healthy"
+            assert "auto_warmup" in ps.json()
+    finally:
+        server.reset_pool(None)
+
+
+def _write_dated_jar(path, minted_at: float, token: str = "v1") -> None:
+    import json
+
+    path.write_text(
+        json.dumps({
+            "user_agent": "UA",
+            "cookies": [{"name": "NID", "value": token, "domain": ".google.com", "path": "/"}],
+            "minted_at": minted_at,
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_auto_warmup_cold_start_mints_and_syncs_vercel(monkeypatch, tmp_path):
+    now = [10_000.0]
+    pool = _make_pool(tmp_path, clock=lambda: now[0])
+    pool.slots[1].cookie_file.unlink(missing_ok=True)
+    pool.slots[0].cookie_file.unlink(missing_ok=True)
+    pool.auto_warmup_enabled = True
+    pool.auto_warmup_interval = 3600
+
+    # Vercel slot previously hit proxy_cookie_missing cooldown
+    pool.slots[0].mark_transient_error(duration=30.0, now=now[0], reason="proxy_cookie_missing")
+    assert pool.slots[0].effective_state(now[0]) == "cooldown"
+
+    seen_states = []
+
+    def fake_warmup(*, cookie_file, driver_factory, force, **_kw):
+        assert force is False
+        # Cold start marks local-0 as refreshing so live requests ride it
+        seen_states.append(pool.slots[1].effective_state(now[0]))
+        _write_dated_jar(cookie_file, now[0], token="fresh-cold")
+        return True
+
+    monkeypatch.setattr(lens_mod, "warmup", fake_warmup)
+
+    outcomes = pool.run_auto_warmup_once()
+    assert outcomes == {"local-0": "ok:cookie_missing"}
+    assert seen_states == ["refreshing"]
+    assert pool.slots[1].effective_state(now[0]) == "healthy"
+    # Vercel slot got atomically synced AND its proxy_cookie_missing cooldown cleared
+    assert pool.slots[0].effective_state(now[0]) == "healthy"
+    synced_jar = lens_mod._load_cookie_jar(pool.slots[0].cookie_file)
+    assert synced_jar is not None
+    assert synced_jar["cookies"][0]["value"] == "fresh-cold"
+    aw = pool.status()["auto_warmup"]
+    assert aw["runs_total"] == 1
+    assert aw["success_total"] == 1
+    assert aw["last_ok"] is True
+    assert aw["last_reason"] == "cookie_missing"
+
+
+def test_auto_warmup_proactive_stale_refresh_keeps_slot_healthy_and_swaps_atomically(
+    monkeypatch, tmp_path,
+):
+    now = [20_000.0]
+    pool = _make_pool(tmp_path, clock=lambda: now[0])
+    pool.auto_warmup_enabled = True
+    pool.auto_warmup_interval = 3600
+
+    # Seed fresh jar -> should be a no-op
+    _write_dated_jar(pool.slots[1].cookie_file, now[0] - 600.0, token="old-tok")
+    _write_dated_jar(pool.slots[0].cookie_file, now[0] - 600.0, token="old-tok")
+
+    calls = []
+    monkeypatch.setattr(lens_mod, "warmup", lambda **kw: calls.append(kw) or True)
+    assert pool.run_auto_warmup_once() == {"local-0": "fresh"}
+    assert calls == []
+
+    # Advance past interval -> proactive renewal runs WITHOUT blocking live traffic
+    now[0] += 4000.0
+    states_during_refresh = []
+
+    def fake_proactive_warmup(*, cookie_file, driver_factory, force, **_kw):
+        assert force is True
+        # Must remain healthy so incoming req/vercel traffic continues uninterrupted
+        states_during_refresh.append(pool.slots[1].effective_state(now[0]))
+        _write_dated_jar(cookie_file, now[0], token="new-tok")
+        return True
+
+    monkeypatch.setattr(lens_mod, "warmup", fake_proactive_warmup)
+    outcomes = pool.run_auto_warmup_once()
+    assert outcomes == {"local-0": "ok:cookie_stale"}
+    assert states_during_refresh == ["healthy"]
+    assert lens_mod._load_cookie_jar(pool.slots[1].cookie_file)["cookies"][0]["value"] == "new-tok"
+    assert lens_mod._load_cookie_jar(pool.slots[0].cookie_file)["cookies"][0]["value"] == "new-tok"
+
+
+def test_auto_warmup_respects_cooldown_and_exponential_backoff(monkeypatch, tmp_path):
+    now = [30_000.0]
+    pool = _make_pool(tmp_path, clock=lambda: now[0])
+    pool.slots[1].cookie_file.unlink(missing_ok=True)
+    pool.slots[0].cookie_file.unlink(missing_ok=True)
+    pool.auto_warmup_enabled = True
+    pool.auto_warmup_retry_base = 60.0
+
+    # 1) Slot in bot_challenge cooldown -> skipped without touching Chromium
+    pool.slots[1].mark_bot_challenge(now[0])
+    called = []
+    monkeypatch.setattr(lens_mod, "warmup", lambda **kw: called.append(1) or False)
+    assert pool.run_auto_warmup_once() == {"local-0": "skipped_cooldown"}
+    assert called == []
+
+    # 2) Cooldown expires, warmup fails -> exponential backoff (60s, then 120s)
+    pool.slots[1].reset_cooldown()
+    assert pool.run_auto_warmup_once() == {"local-0": "failed:cookie_missing"}
+    assert len(called) == 1
+    assert pool.run_auto_warmup_once() == {"local-0": "skipped_backoff"}
+    assert len(called) == 1
+
+    now[0] += 61.0
+    assert pool.run_auto_warmup_once() == {"local-0": "failed:cookie_missing"}
+    assert len(called) == 2
+    assert pool.auto_warmup_status(now[0])["consecutive_failures"] == 2
+    assert pool.auto_warmup_status(now[0])["next_retry_in_seconds"] == pytest.approx(120.0, abs=1.0)
+
+
+def test_auto_warmup_background_thread_start_and_stop(monkeypatch, tmp_path):
+    ran = threading.Event()
+    pool = _make_pool(tmp_path)
+    pool.slots[1].cookie_file.unlink(missing_ok=True)
+    pool.slots[0].cookie_file.unlink(missing_ok=True)
+    pool.auto_warmup_enabled = True
+    pool.auto_warmup_startup_jitter = 0.0
+    pool.auto_warmup_check_interval = 60
+
+    def fake_warmup(*, cookie_file, driver_factory, force, **_kw):
+        _write_dated_jar(cookie_file, time.time(), token="bg-tok")
+        ran.set()
+        return True
+
+    monkeypatch.setattr(lens_mod, "warmup", fake_warmup)
+    try:
+        assert pool.start_auto_warmup() is True
+        assert ran.wait(timeout=3.0)
+        deadline = time.time() + 3.0
+        while pool.auto_warmup_status()["runs_total"] < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        assert pool.auto_warmup_status()["running"] is True
+        assert pool.auto_warmup_status()["success_total"] == 1
+        assert lens_mod._load_cookie_jar(pool.slots[0].cookie_file) is not None
+    finally:
+        pool.stop_auto_warmup(timeout=2.0)
+    assert pool.auto_warmup_status()["running"] is False
+
+
+def test_auto_warmup_fresh_poll_preserves_vercel_lookup_failed_and_bot_challenge_cooldowns(
+    monkeypatch, tmp_path,
+):
+    now = [40_000.0]
+    pool = _make_pool(tmp_path, clock=lambda: now[0])
+    pool.auto_warmup_enabled = True
+    pool.auto_warmup_interval = 3600
+
+    # Both jars already exist and are fresh -> no new mint happens
+    _write_dated_jar(pool.slots[1].cookie_file, now[0] - 100.0, token="same-tok")
+    _write_dated_jar(pool.slots[0].cookie_file, now[0] - 100.0, token="same-tok")
+
+    pool.slots[0].mark_transient_error(duration=60.0, now=now[0], reason="proxy_lookup_failed")
+    assert pool.run_auto_warmup_once() == {"local-0": "fresh"}
+    # Cooldown must NOT be prematurely cleared because no newer jar was synced
+    assert pool.slots[0].effective_state(now[0]) == "cooldown"
+    assert pool.slots[0].cooldown_reason == "proxy_lookup_failed"
+
+    # Bot challenge cooldown is also preserved even when a newer jar IS synced
+    pool.slots[0].mark_bot_challenge(now[0])
+    _write_dated_jar(pool.slots[1].cookie_file, now[0], token="brand-new")
+    assert pool.run_auto_warmup_once() == {"local-0": "fresh"}
+    assert pool.slots[0].effective_state(now[0]) == "cooldown"
+    assert pool.slots[0].cooldown_reason == "bot_challenge"
+
+
+def test_auto_warmup_bot_challenge_puts_local_slot_in_cooldown(monkeypatch, tmp_path):
+    now = [50_000.0]
+    pool = _make_pool(tmp_path, clock=lambda: now[0])
+    pool.slots[1].cookie_file.unlink(missing_ok=True)
+    pool.auto_warmup_enabled = True
+
+    def sorry_warmup(**kw):
+        assert kw.get("raise_on_bot_challenge") is True
+        raise lens_mod.LensBotChallengeError("https://www.google.com/sorry/index")
+
+    monkeypatch.setattr(lens_mod, "warmup", sorry_warmup)
+    outcomes = pool.run_auto_warmup_once()
+    assert outcomes == {"local-0": "bot_challenge:cookie_missing"}
+    assert pool.slots[1].effective_state(now[0]) == "cooldown"
+    assert pool.slots[1].cooldown_reason == "bot_challenge"
+
+
+def test_auto_warmup_double_checks_freshness_under_refresh_lock(monkeypatch, tmp_path):
+    now = [60_000.0]
+    pool = _make_pool(tmp_path, clock=lambda: now[0])
+    pool.auto_warmup_enabled = True
+    pool.auto_warmup_interval = 3600
+
+    # Stale jar initially
+    _write_dated_jar(pool.slots[1].cookie_file, now[0] - 5000.0, token="stale")
+
+    # Simulate a concurrent request refreshing the jar right before refresh_lock is acquired
+    orig_lock = pool.slots[1].refresh_lock
+
+    class InterceptLock:
+        def acquire(self, blocking=True):
+            _write_dated_jar(pool.slots[1].cookie_file, now[0], token="just-refreshed")
+            return orig_lock.acquire(blocking=blocking)
+
+        def release(self):
+            orig_lock.release()
+
+    pool.slots[1].refresh_lock = InterceptLock()  # type: ignore[assignment]
+    called = []
+    monkeypatch.setattr(lens_mod, "warmup", lambda **kw: called.append(1) or True)
+
+    assert pool.run_auto_warmup_once() == {"local-0": "fresh"}
+    assert called == []
+
+
+@pytest.mark.anyio
+async def test_server_lifespan_starts_and_stops_auto_warmup(monkeypatch, tmp_path):
+    pytest.importorskip("fastapi")
+    from glens import server
+
+    ran = threading.Event()
+    pool = _make_pool(tmp_path)
+    pool.slots[1].cookie_file.unlink(missing_ok=True)
+    pool.slots[0].cookie_file.unlink(missing_ok=True)
+    pool.auto_warmup_enabled = True
+    pool.auto_warmup_startup_jitter = 0.0
+    pool.auto_warmup_check_interval = 60
+
+    def fake_warmup(*, cookie_file, driver_factory, force, **_kw):
+        _write_dated_jar(cookie_file, time.time(), token="lifespan-tok")
+        ran.set()
+        return True
+
+    monkeypatch.setattr(lens_mod, "warmup", fake_warmup)
+    server.reset_pool(pool)
+    app = server.create_app()
+    try:
+        async with app.router.lifespan_context(app):
+            assert ran.wait(timeout=3.0)
+            assert pool.auto_warmup_status()["running"] is True
+        assert pool.auto_warmup_status()["running"] is False
     finally:
         server.reset_pool(None)

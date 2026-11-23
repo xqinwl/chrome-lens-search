@@ -30,6 +30,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tini \
     && rm -rf /var/lib/apt/lists/*
 
+ENV GLENS_AUTO_WARMUP=1 \
+    GLENS_AUTO_WARMUP_INTERVAL=14400
+
 USER glens
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s \
