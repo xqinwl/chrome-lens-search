@@ -44,32 +44,95 @@ if result:                             # None when the lookup fails
 
 ## HTTP service and Docker
 
-From the project directory, start the service and submit a local file or a public image URL. Replace the sample filename or URL with your image.
+### 1. Configure `.env` and start
+
+Create a `.env` file in the project root (gitignored):
+
+```env
+# Optional Vercel proxy (single URL or comma-separated multi-region URLs)
+GLENS_VERCEL_PROXY_URL=https://your-vercel-app.vercel.app/api/lens
+GLENS_VERCEL_PROXY_SECRET=your-secret
+
+# Routing, failover, and rate-limit defaults (compose.yaml defaults, tuned for 60+ req/min)
+GLENS_PROXY_FALLBACK=1
+GLENS_VERCEL_RPM=50
+GLENS_LOCAL_RPM=30
+GLENS_SLOT_MIN_INTERVAL=0.3
+
+# Optional outbound proxy for local channel + Chromium cookie refreshes (useful on cloud VMs)
+# GLENS_PROXY=http://user:pass@proxy-host:port
+# GLENS_LOCAL_PROXIES=http://proxy1:8080,http://proxy2:8080
+
+# Optional local-dev only: allow Clash Fake-IP (198.18.0.0/15); keep 0 in production
+# GLENS_ALLOW_FAKE_IP=1
+```
+
+Start the service and prewarm the session:
 
 ```bash
 docker compose up -d --build
 curl http://localhost:8000/healthz
+curl -X POST http://localhost:8000/v1/warmup
+curl http://localhost:8000/v1/pool/status
+```
+
+Compose builds for the host architecture (Linux AMD64 or ARM64) with Chromium, its matching driver, `curl_cffi`, and a virtual display (`Xvfb`). It publishes port `8000` on localhost (override with `GLENS_PORT=8080`). Other containers on the Compose network can reach `http://glens:8000`. The named volume `glens-data` mounted at `/data` preserves cookies, Chrome profile, result cache, and rotating logs across restarts and rebuilds. On cloud VMs (e.g., DigitalOcean), at least **2 GB RAM** (or 1 GB RAM + 2 GB swap) is recommended for Chromium refreshes.
+
+### 2. Search requests
+
+**Recommended (Vercel-first with automatic local failover / load-sharing):** send JSON with `image_url` and `"proxy": "vercel"`:
+
+```bash
+curl -i -H 'Content-Type: application/json' \
+  -d '{"image_url":"https://example.com/shoe.jpg","proxy":"vercel","max_matches":5}' \
+  http://localhost:8000/v1/search
+```
+
+**Local channel only:** upload a file or omit `proxy`:
+
+```bash
 curl -F 'image=@shoe.jpg' -F 'lang=zh-CN' http://localhost:8000/v1/search
 curl -H 'Content-Type: application/json' \
   -d '{"image_url":"https://example.com/shoe.jpg","max_matches":5}' \
   http://localhost:8000/v1/search
 ```
 
-Compose builds for the host architecture (Linux AMD64 or ARM64) with Chromium, its matching driver, and a virtual display for browser retries. It publishes port 8000 on localhost. Other containers on the Compose network can use `http://glens:8000`. The API is intended for trusted clients with no application-level authentication. Use `GLENS_PORT=8080 docker compose up -d` if host port 8000 is occupied.
+- Pass `"proxy": "vercel"` on every request that should use Vercel-first routing with local fallback (`GLENS_PROXY_FALLBACK=1`). Omitting `proxy` routes strictly to local slots.
+- `proxy: "vercel"` requires `image_url` and does not support `resolve_links: true`.
+- Uploads are capped at 10 MiB and normalized to compact JPEG (`GLENS_MAX_IMAGE_EDGE=1024`) before upload.
 
-The first search creates a session on demand. Chrome tries headless first and retries with the virtual display if Google returns an incomplete page. The named volume mounted at `/data` preserves the session and optional result cache across restarts and rebuilds. To prewarm before accepting traffic, run `docker compose exec glens glens warmup`. `GET /healthz` reports HTTP availability. `GET /v1/status` reports the backend, cache setting, local cookie-file readiness and age, and the concurrent search limit. A live query verifies whether Google still accepts the session.
+### 3. Endpoints, headers, and errors
 
-Search accepts `lang`, `max_matches`, `max_titles`, and `resolve_links` as JSON or multipart fields. The 10 MiB limit applies to each image. URL downloads and redirects must resolve to public HTTP(S) destinations. A successful response contains `top_title`, `titles`, and `matches` (each with `title`, `url`, and `domain`). A confirmed miss returns HTTP 200 with a null title and empty lists.
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/healthz` | `GET` | Liveness probe (`{"ok": true}`) |
+| `/v1/status` | `GET` | Session readiness (`default_backend`, `cache_enabled`, `req_ready`, `jar_age_seconds`) |
+| `/v1/pool/status` | `GET` | Live route pool telemetry: per-slot health, cooldown reason/remaining seconds, rolling 60s RPM, counters, and L1/L2 cache stats |
+| `/v1/warmup` | `POST` | Reset cooldowns and mint fresh session cookies on demand (optional JSON `{"slot_id": null, "reset_cooldown": true, "force": true}`) |
+| `/v1/search` | `POST` | Visual product search returning `top_title`, `titles`, and `matches` |
 
-If Docker DNS returns a Clash fake IP such as `198.18.x.x` for an image host, configure Clash to return the host's real public address. For Clash Verge, add `cdn.globus.pictures` to `dns.fake-ip-filter`. To route that CDN directly, also place `DOMAIN,cdn.globus.pictures,DIRECT` before the profile's catch-all proxy rule. Recreate the container after changing DNS settings so it resolves the host again. The API rejects fake, private, and reserved addresses as a server-side request forgery safeguard.
+Response headers:
+- **`X-Request-Id`**: per-request trace ID (echoes a safe client-supplied `X-Request-Id` when provided), matching `req_id=` in server logs.
+- **`X-Glens-Route`**: winning cache tier or route (`cache-l1`, `cache-l2`, `vercel-0`, `local-0`).
 
-The requests backend can run independent searches in parallel, with no extra API-level concurrency limit; actual throughput depends on the Python worker pool and available resources. Browser fallbacks and session refreshes are serialized to protect the shared Chrome profile and cookie jar. Errors use `{"error":{"code":"…","message":"…"}}`. HTTP 413 means too large, 415 unsupported content, and 422 invalid input. HTTP 429 `upstream_rate_limited` means Google Lens explicitly returned 429 (and includes `Retry-After` when Google sends it). HTTP 502 distinguishes image download failures (`image_download_failed`) from an inconclusive Lens lookup (`lens_lookup_failed`).
+Errors use `{"error":{"code":"…","message":"…"}}`: `413` too large, `415` unsupported media/invalid image, `422` invalid input or non-public URL, `429 upstream_rate_limited` (with `Retry-After`), `502` (`image_download_failed`, `lens_lookup_failed`, or `proxy_*`), and `503 upstream_bot_challenge` (with `Retry-After`) when all routes are cooling down after Google `/sorry` challenges.
 
-To use the Vercel proxy, set `GLENS_VERCEL_PROXY_URL` and `GLENS_VERCEL_PROXY_SECRET`, then include `"proxy":"vercel"` in a JSON request. Proxy mode accepts `image_url` only, requires an existing Google cookie jar, skips the local result cache, and returns a proxy error without falling back to Chrome. Oversized images are recompressed to fit Vercel's request budget. Set the secret to the same value as the Vercel project's `CRON_SECRET`.
+### 4. Routing, caching, and production logs
 
-To serve directly from a checkout, install `pip install ".[server,browser]"` and run `glens serve`. The default is `127.0.0.1:8000`; use `--host` and `--port` to change it.
+- **RoutePool & self-healing:** `GLENS_PROXY_FALLBACK=1` routes `proxy: "vercel"` requests to healthy Vercel slots first and automatically fails over / load-shares to local slots (`curl_cffi` HTTP/2 transport + rolling per-route cookies + single-flight Chromium refresh that re-syncs fresh cookies back to Vercel). Scale out by adding comma-separated `GLENS_VERCEL_PROXY_URLS` or `GLENS_LOCAL_PROXIES`.
+- **Two-level cache:** Docker enables `GLENS_CACHE=1` (including proxy mode) with L1 SHA-256 exact hits, L2 64-bit dHash near-duplicate hits (`GLENS_CACHE_DHASH_THRESHOLD=4`), and in-flight request coalescing.
+- **Rotating production logs:** The server writes UTC millisecond-timestamped structured logs to both stderr (`docker compose logs -f`) and `/data/logs/glens.log` (20 MiB × 5 backups by default; configurable via `GLENS_LOG_LEVEL`, `GLENS_LOG_FILE`, `GLENS_LOG_MAX_BYTES`, `GLENS_LOG_BACKUP_COUNT`). Query strings on image URLs and proxy secrets are never logged.
 
-If a URL returns `422 invalid_image_url`, check that the hostname and every redirect resolve to public IP addresses. A `502 image_download_failed` means the URL host could not serve the image. A `502 lens_lookup_failed` with `req_ready: false` after cold start means no usable Lens session was established. Run `docker compose exec glens glens warmup -v` to inspect the browser step.
+```bash
+docker compose logs -f glens
+docker compose exec glens tail -n 200 /data/logs/glens.log
+docker compose exec glens grep 'req_id=<X-Request-Id>' /data/logs/glens.log
+docker compose exec glens grep -E 'WARNING|ERROR|Chromium|cooling down' /data/logs/glens.log
+```
+
+**Local Clash Fake-IP note:** If Docker DNS resolves image hosts to `198.18.x.x`, either exclude those domains in Clash `dns.fake-ip-filter` or set `GLENS_ALLOW_FAKE_IP=1` in your local `.env` (allows `198.18.0.0/15` only; loopback, RFC1918, and cloud metadata IPs remain blocked). Keep `GLENS_ALLOW_FAKE_IP=0` on public cloud servers.
+
+To serve directly from a checkout, install `pip install ".[server,browser]"` and run `glens serve` (default `127.0.0.1:8000`; use `--host` and `--port` to override).
 
 ---
 
@@ -216,9 +279,25 @@ Everything is a per-call argument; env vars are just the defaults.
 | `lang` | `GLENS_LANG` | *(none)* — preferred response language via `Accept-Language`, e.g. `de`, `pt-BR` |
 | `use_cache` | `GLENS_CACHE` | off |
 | — | `GLENS_CACHE_TTL` | `86400` — cache entry lifetime in seconds |
-| — | `GLENS_CACHE_DIR` | `~/.cache/glens/results` |
-| — | `GLENS_HEADLESS` | `1` |
-| — | `GLENS_CHROME_PROFILE` | *(none)* — persistent Chrome profile dir |
+| — | `GLENS_CACHE_DIR` | `~/.cache/glens/results` (`/data/results` in Docker) |
+| — | `GLENS_CACHE_DHASH_THRESHOLD` | `4` — L2 64-bit dHash Hamming distance threshold (`0` disables L2) |
+| — | `GLENS_CACHE_MAX_ENTRIES` | `10000` — max cache files before oldest eviction |
+| — | `GLENS_MAX_IMAGE_EDGE` | `1024` — longest edge normalization in pixels (`0` disables resize) |
+| — | `GLENS_RESOLVE_MAX` | `5` — max links resolved per call when `resolve_links=True` |
+| — | `GLENS_HEADLESS` | `1` (`0` in Docker with Xvfb) |
+| — | `GLENS_CHROME_PROFILE` | *(none)* — persistent Chrome profile dir (`/data/chrome-profile` in Docker) |
+| — | `GLENS_VERCEL_PROXY_URL` / `GLENS_VERCEL_PROXY_URLS` | *(none)* — single or comma-separated Vercel proxy HTTPS URLs |
+| — | `GLENS_VERCEL_PROXY_SECRET` / `GLENS_VERCEL_PROXY_SECRETS` | *(none)* — shared secret(s) matching Vercel `CRON_SECRET` |
+| — | `GLENS_PROXY_FALLBACK` | `1` — fail over / load-share from Vercel to local slots |
+| — | `GLENS_VERCEL_RPM` | `50` (Compose) / `20` (default) — per-slot RPM cap (`0` = unlimited) |
+| — | `GLENS_LOCAL_RPM` | `30` (Compose) / `15` (default) — per-slot RPM cap (`0` = unlimited) |
+| — | `GLENS_SLOT_MIN_INTERVAL` | `0.3` (Compose) / `0.5` (default) — minimum spacing per slot (seconds) |
+| — | `GLENS_PROXY` / `GLENS_LOCAL_PROXIES` | *(none)* — outbound proxy URL(s) for local HTTP & Chromium refreshes |
+| — | `GLENS_ALLOW_FAKE_IP` | `0` — local-dev opt-in to allow Clash Fake-IP (`198.18.0.0/15`) |
+| — | `GLENS_LOG_LEVEL` | `INFO` — server log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| — | `GLENS_LOG_FILE` | `/data/logs/glens.log` (Docker) — rotating log file path |
+| — | `GLENS_LOG_MAX_BYTES` | `20971520` — max bytes per log file (20 MiB) |
+| — | `GLENS_LOG_BACKUP_COUNT` | `5` — rotated backup log files to keep |
 
 Pointing `GLENS_CHROME_PROFILE` at a persistent directory lets the verified session survive across runs, keeping the fast path fast.
 

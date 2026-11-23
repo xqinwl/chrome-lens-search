@@ -50,36 +50,128 @@ if result:                             # 查询失败或无匹配时返回 None
 
 ## HTTP 服务与 Docker 部署
 
-在项目目录中启动服务，然后上传图片或提交公网图片 URL。请将示例文件名或 URL 换成实际图片。
+### 1. 配置 `.env` 并启动
+
+在项目根目录创建 `.env`（已被 `.gitignore` 忽略，不会提交到仓库）：
+
+```env
+# 推荐：配置 Vercel 代理（支持单个 URL 或逗号分隔的多个区域 URL）
+GLENS_VERCEL_PROXY_URL=https://your-vercel-app.vercel.app/api/lens
+GLENS_VERCEL_PROXY_SECRET=your-secret
+
+# 路由分流与控频（compose.yaml 默认即以下值，目标 60+ req/min）
+GLENS_PROXY_FALLBACK=1
+GLENS_VERCEL_RPM=50
+GLENS_LOCAL_RPM=30
+GLENS_SLOT_MIN_INTERVAL=0.3
+
+# 可选：若云服务器机房 IP 频繁遇到 Google 验证码，可为本地通道配置出口代理
+# GLENS_PROXY=http://user:pass@proxy-host:port
+# GLENS_LOCAL_PROXIES=http://proxy1:8080,http://proxy2:8080
+
+# 可选：仅本机使用 Clash Fake-IP (198.18.0.0/15) 调试时开启，生产环境请保持默认 0
+# GLENS_ALLOW_FAKE_IP=1
+```
+
+启动服务并预热会话：
 
 ```bash
 docker compose up -d --build
 curl http://localhost:8000/healthz
+curl -X POST http://localhost:8000/v1/warmup
+curl http://localhost:8000/v1/pool/status
+```
+
+Compose 根据宿主机架构构建 Linux AMD64 或 ARM64 镜像，内置 Chromium、配套驱动、`curl_cffi` 和虚拟显示器（`Xvfb`）。宿主机通过本地 `8000` 端口访问（可用 `GLENS_PORT=8080` 修改），同一 Compose 网络内的其他容器可访问 `http://glens:8000`。命名卷 `glens-data` 挂载于 `/data`，持久保存 Cookie、Chrome Profile、结果缓存与轮转日志，重启或重建容器后均可复用。建议云服务器至少配置 **2 GB 内存**（或 1 GB 内存 + 2 GB Swap），以保证 Chromium 续期不发生 OOM。
+
+### 2. 调用搜索接口
+
+**推荐（启用 Vercel 优先 + 本地自动分流/容灾）：** 使用 JSON 提交公网 `image_url`，并带上 `"proxy": "vercel"`：
+
+```bash
+curl -i -H 'Content-Type: application/json' \
+  -d '{"image_url":"https://example.com/shoe.jpg","proxy":"vercel","max_matches":5}' \
+  http://localhost:8000/v1/search
+```
+
+**仅走本地容器通道：** 上传本地图片文件，或不传 `proxy` 字段：
+
+```bash
 curl -F 'image=@shoe.jpg' -F 'lang=zh-CN' http://localhost:8000/v1/search
 curl -H 'Content-Type: application/json' \
   -d '{"image_url":"https://example.com/shoe.jpg","max_matches":5}' \
   http://localhost:8000/v1/search
 ```
 
-Compose 根据宿主机架构构建 Linux AMD64 或 ARM64 镜像，内置 Chromium、配套驱动和用于浏览器重试的虚拟显示器。宿主机通过本地 8000 端口访问，同一 Compose 网络内的容器可访问 `http://glens:8000`。接口面向可信内网，默认免鉴权。若宿主机 8000 端口已被占用，可用 `GLENS_PORT=8080 docker compose up -d` 切换宿主机端口。
+> **注意**：
+> - 客户端请求时**必须带上 `"proxy": "vercel"`** 才会进入 Vercel 优先 + 本地分流/容灾调度；不传 `proxy` 只会走本地 `local-*` 通道。
+> - `proxy: "vercel"` 仅支持 `image_url` 输入，且不支持 `resolve_links: true`。
+> - 两种输入均支持 `lang`、`max_matches`、`max_titles`、`resolve_links`（本地通道）；单图上限 10 MiB，服务端默认按长边 `GLENS_MAX_IMAGE_EDGE=1024` 归一化压缩为紧凑 JPEG 后上传。
 
-首次查询按需建立会话。Chrome 先尝试无头模式，Google 返回不完整页面时，会在虚拟显示器中重试。`/data` 命名卷保存 Cookie 和可选的结果缓存，重启或重建容器后仍可复用。要在接入流量前预热，可运行 `docker compose exec glens glens warmup`。`GET /healthz` 用于检查 HTTP 服务是否在线。`GET /v1/status` 显示后端、缓存开关、本地会话文件是否可读及其年龄，以及允许的搜索并发数；会话是否仍被 Google 接受由实际查询验证。
+### 3. HTTP 接口一览
 
-两种输入均支持 `lang`、`max_matches`、`max_titles`、`resolve_links`。单图上限为 10 MiB。远程 URL 和各次重定向都须指向公网 HTTP(S) 地址。成功响应包含 `top_title`、`titles` 和 `matches`，每条匹配含 `title`、`url`、`domain`。确认无匹配时返回 HTTP 200，标题为 null，列表为空。
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/healthz` | `GET` | 存活探针，返回 `{"ok": true}` |
+| `/v1/status` | `GET` | 会话基础状态（`default_backend`、`cache_enabled`、`req_ready`、`jar_age_seconds`） |
+| `/v1/pool/status` | `GET` | 路由池实时状态：各槽位健康度、冷却原因与剩余秒数、近 1 分钟 RPM、成功/验证码/限流/错误计数及 L1/L2 缓存统计 |
+| `/v1/warmup` | `POST` | 在线重置冷却并刷新会话（可选 JSON：`{"slot_id": null, "reset_cooldown": true, "force": true}`） |
+| `/v1/search` | `POST` | 执行以图搜商品，返回 `top_title`、`titles`、`matches`（确认无匹配时返回 HTTP 200 及空列表） |
 
-如果 Docker DNS 将图片域名解析成 Clash Fake-IP 地址（例如 `198.18.x.x`），需要让 Clash 对该域名返回真实公网地址。在 Clash Verge 配置中，将 `cdn.globus.pictures` 加入 `dns.fake-ip-filter`。如果还希望该 CDN 直连，再在兜底代理规则前添加 `DOMAIN,cdn.globus.pictures,DIRECT`。修改 DNS 规则后重建容器，让它重新解析域名。API 会拒绝虚拟、内网和保留 IP，这是服务端防止请求伪造的安全校验。
+### 4. 响应头与错误码
 
-requests 后端支持独立搜索并发，服务端内置路由池（`RoutePool`）与控频熔断机制。错误格式为 `{"error":{"code":"…","message":"…"}}`。413 表示请求过大，415 表示内容格式不受支持，422 表示输入无效。HTTP 429 `upstream_rate_limited` 表示 Google Lens 触发了 429 限流或所有可用出口到达速率上限；HTTP 503 `upstream_bot_challenge` 表示所有可用出口均触发了 Google `/sorry` 机器人检测并进入熔断冷却（两者均会返回 `Retry-After` 头，避免继续撞墙）。502 的错误码区分图片下载失败（`image_download_failed`）与 Lens 查询失败或结果无法判断（`lens_lookup_failed`）。成功响应会附带 `X-Glens-Route` 响应头（如 `cache-l1`、`cache-l2`、`vercel-0`、`local-0`），便于观测缓存命中与路由分流情况。
+每次请求均返回以下观测响应头：
+- **`X-Request-Id`**：单次请求追踪 ID（支持客户端在请求头传入自定义 `X-Request-Id` 透传），与服务端日志中的 `req_id=` 一一对应。
+- **`X-Glens-Route`**：本次命中的具体路由或缓存层，如 `cache-l1`（SHA-256 精确命中）、`cache-l2`（dHash 近似图命中）、`vercel-0`、`local-0`。
 
-要通过 Vercel 代理搜索，设置 `GLENS_VERCEL_PROXY_URL`（或逗号分隔的多个区域地址 `GLENS_VERCEL_PROXY_URLS`）和 `GLENS_VERCEL_PROXY_SECRET`，并在 JSON 请求中传 `"proxy":"vercel"`。Docker 部署默认开启 `GLENS_PROXY_FALLBACK=1` 与两级本地缓存（`GLENS_CACHE=1`，含 SHA-256 精确匹配、dHash 近似图去重与同图并发合并）：请求优先走健康的 Vercel 路由并受 `GLENS_VERCEL_RPM` 控频保护；当 Vercel 触发 `/sorry`、429、代理异常或达到单路速率上限时，会自动熔断冷却并无缝分流/降级到本地容器通道（支持 `curl_cffi` HTTP/2 指纹、持久化 Chrome Profile 与按路由隔离的 Cookie 滚动回写）。若需严格禁止回退，可将 `GLENS_PROXY_FALLBACK=0`。所有上传图片默认按长边 `GLENS_MAX_IMAGE_EDGE=1024` 归一化为紧凑 JPEG；如需进一步横向扩容吞吐，可直接通过 `GLENS_VERCEL_PROXY_URLS` 或 `GLENS_LOCAL_PROXIES` 配置多出口，无需改代码。
+错误响应格式统一为 `{"error":{"code":"…","message":"…"}}`：
 
-运维接口：`GET /v1/pool/status` 查看各路由状态、剩余冷却时间、近 1 分钟请求数与缓存命中统计；`POST /v1/warmup`（可选传 `{"slot_id": null, "reset_cooldown": true, "force": true}`）可在不重启容器的情况下重置冷却并刷新会话。
+| HTTP 状态码 | 错误码 (`code`) | 含义与处理建议 |
+|-------------|-----------------|----------------|
+| `413` | `request_too_large` / `image_too_large` | 请求体或图片超过 10 MiB 上限 |
+| `415` | `unsupported_media_type` / `invalid_image` | Content-Type 非 JSON/multipart，或图片内容损坏 |
+| `422` | `invalid_request` / `invalid_image_url` | 参数非法，或图片 URL / 重定向解析为非公网 IP（本机 Clash Fake-IP 见下文） |
+| `429` | `upstream_rate_limited` | Google 返回 429 或所有可用槽位到达限速上限（附带 `Retry-After` 头，建议按该秒数退避） |
+| `502` | `image_download_failed` / `lens_lookup_failed` / `proxy_*` | 图片源站无法下载，或 Lens 未返回可用结果页 |
+| `503` | `upstream_bot_challenge` | 所有可用出口均触发 Google `/sorry` 机器人检测并进入熔断冷却（附带 `Retry-After` 头） |
 
-生产日志：服务同时向标准错误输出（`docker compose logs -f`）和持久化卷文件 `/data/logs/glens.log` 写入带 UTC 时间戳的结构化日志（默认单文件 20 MiB、保留 5 份自动轮转，可通过 `GLENS_LOG_LEVEL`、`GLENS_LOG_FILE`、`GLENS_LOG_MAX_BYTES`、`GLENS_LOG_BACKUP_COUNT` 调整）。每次请求会返回 `X-Request-Id` 响应头，日志中按 `req_id` 记录路由、耗时、结果数、错误码、熔断冷却与 Chromium 续期轨迹，且自动脱敏图片 URL 查询参数与代理密钥。
+### 5. 路由调度、缓存与扩容机制
 
-从源码直接运行可使用 `pip install ".[server,browser]"` 和 `glens serve`，默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 调整。
+- **Vercel 优先 + 自动分流/容灾**：开启 `GLENS_PROXY_FALLBACK=1`（默认）时，`RoutePool` 优先使用健康的 `vercel-*` 槽位；当 Vercel 触发 `/sorry`、429、代理异常、返回退化页或达到单路 RPM 上限时，自动冷却该槽位并无缝分流/降级到本地 `local-*` 通道。
+- **自动 Cookie 滚动与单飞续期**：本地通道优先使用 `curl_cffi`（模拟 Chrome TLS/HTTP2 指纹）并发请求，并按路由隔离滚动回写 Cookie；遇到 JS-gate 时单飞唤起一次 Chromium 重新签发 Cookie 并自动同步给所有 Vercel 槽位（其余并发请求自动等待复用新会话，不会引发浏览器雪崩）。
+- **两级本地缓存与并发合并**：Docker 默认开启 `GLENS_CACHE=1`（含 Vercel 代理模式），包含 L1 SHA-256 精确缓存、L2 感知哈希 dHash 近似图去重（`GLENS_CACHE_DHASH_THRESHOLD=4`）以及同图并发 Single-Flight 合并，减少重复上传。
+- **横向扩容**：若长期持续高吞吐（如连续数小时每分钟 60+ 次），可在 `.env` 中通过 `GLENS_VERCEL_PROXY_URLS`（逗号分隔多个不同区域的 Vercel 实例）和/或 `GLENS_LOCAL_PROXIES`（逗号分隔多个本地出口代理）线性扩容，无需修改代码。
 
-若 URL 返回 `422 invalid_image_url`，请确认图片域名及每次重定向都解析到公网 IP。`502 image_download_failed` 表示图片地址无法访问或拒绝下载。冷启动后若收到 `502 lens_lookup_failed` 且 `req_ready` 为 `false`，表示尚未建立可用 Lens 会话。可运行 `docker compose exec glens glens warmup -v` 检查浏览器步骤。
+### 6. 生产日志与排错复盘
+
+服务同时向 **stderr**（`docker compose logs -f`）和持久化卷文件 **`/data/logs/glens.log`** 写入带 UTC 毫秒时间戳的结构化日志（默认单文件 20 MiB、保留 5 份自动轮转，重建容器不丢日志）。日志自动剥离图片 URL 中的查询参数/签名，且不输出代理密钥或 Cookie 值。
+
+单次请求日志示例：
+```text
+2026-11-23T04:19:13.007Z INFO [glens] search req_id=verify-log-001 status=200 route=vercel-0 proxy=vercel input=https://picsum.photos raw_bytes=48177 upload_bytes=48177 matches=2 titles=6 duration_ms=5854
+```
+
+生产复盘常用命令：
+
+```bash
+# 实时查看日志
+docker compose logs -f glens
+
+# 查看持久化日志文件（容器重建后仍保留）
+docker compose exec glens tail -n 200 /data/logs/glens.log
+
+# 用客户端拿到的 X-Request-Id 精确追踪单次请求
+docker compose exec glens grep 'req_id=你的请求ID' /data/logs/glens.log
+
+# 快速筛选异常、熔断冷却、限流与 Chromium 续期记录
+docker compose exec glens grep -E 'WARNING|ERROR|Chromium|cooling down' /data/logs/glens.log
+```
+
+### 7. 常见部署问题
+
+- **本机使用 Clash 时 `image_url` 返回 `422 invalid_image_url`**：Clash Fake-IP 会将公网域名解析为 `198.18.x.x`，被服务端 SSRF 安全校验拦截。**本机调试**可在 `.env` 中加 `GLENS_ALLOW_FAKE_IP=1` 后重启容器（仅放行 `198.18.0.0/15`，内网与云元数据 IP 仍严格拦截），或在 Clash `dns.fake-ip-filter` 中排除图片域名。**DigitalOcean 等公网云服务器无此问题，生产环境请保持 `GLENS_ALLOW_FAKE_IP=0`。**
+- **云服务器机房 IP 遇到 `/sorry`**：若 `POST /v1/warmup` 或 `/v1/pool/status` 显示 `local-0` 触发 `bot_challenge`，在 `.env` 中配置 `GLENS_PROXY`（或 `GLENS_LOCAL_PROXIES`）为干净代理出口，Chromium 续期与本地通道会自动走该代理。
+- **源码直接运行**：`pip install ".[server,browser]"` 后运行 `glens serve`（默认监听 `127.0.0.1:8000`，可用 `--host` 和 `--port` 调整）。
 
 ---
 
@@ -237,9 +329,25 @@ for path in my_images:
 | `lang` | `GLENS_LANG` | *(空)* | 通过 `Accept-Language` 偏好的语言，如 `zh-CN`, `en`, `de` |
 | `use_cache` | `GLENS_CACHE` | 关闭 | 是否启用本地结果缓存 |
 | — | `GLENS_CACHE_TTL` | `86400` | 缓存有效期（秒），默认 24 小时 |
-| — | `GLENS_CACHE_DIR` | `~/.cache/glens/results` | 本地缓存目录 |
-| — | `GLENS_HEADLESS` | `1` | 浏览器模式是否使用无头模式 (`1` 为开启) |
-| — | `GLENS_CHROME_PROFILE` | *(空)* | Chrome 持久化用户数据目录 (Profile) |
+| — | `GLENS_CACHE_DIR` | `~/.cache/glens/results` | 本地缓存目录（Docker 默认 `/data/results`） |
+| — | `GLENS_CACHE_DHASH_THRESHOLD` | `4` | L2 感知哈希（64-bit dHash）汉明距离阈值，`0` 为关闭 L2 |
+| — | `GLENS_CACHE_MAX_ENTRIES` | `10000` | 本地缓存最大条数，超出自动淘汰最旧条目 |
+| — | `GLENS_MAX_IMAGE_EDGE` | `1024` | 上传图片归一化最大长边像素，`0` 为禁用缩放 |
+| — | `GLENS_RESOLVE_MAX` | `5` | `resolve_links=True` 最多并发解析的链接数 |
+| — | `GLENS_HEADLESS` | `1` | 浏览器模式是否使用无头模式（Docker 中使用 Xvfb 默认 `0`） |
+| — | `GLENS_CHROME_PROFILE` | *(空)* | Chrome 持久化用户数据目录（Docker 默认 `/data/chrome-profile`） |
+| — | `GLENS_VERCEL_PROXY_URL` / `GLENS_VERCEL_PROXY_URLS` | *(空)* | 单个或多个逗号分隔的 Vercel 代理 HTTPS 地址 |
+| — | `GLENS_VERCEL_PROXY_SECRET` / `GLENS_VERCEL_PROXY_SECRETS` | *(空)* | Vercel 代理鉴权密钥（与 Vercel 侧 `CRON_SECRET` 一致） |
+| — | `GLENS_PROXY_FALLBACK` | `1` | Vercel 限流/异常/冷却时是否自动分流降级到本地通道 |
+| — | `GLENS_VERCEL_RPM` | `50` (Compose) / `20` (代码默认) | 单个 Vercel 槽位每分钟最大请求数（`0` 为不限） |
+| — | `GLENS_LOCAL_RPM` | `30` (Compose) / `15` (代码默认) | 单个本地槽位每分钟最大请求数（`0` 为不限） |
+| — | `GLENS_SLOT_MIN_INTERVAL` | `0.3` (Compose) / `0.5` (代码默认) | 单槽位两次请求之间的最小间隔（秒） |
+| — | `GLENS_PROXY` / `GLENS_LOCAL_PROXIES` | *(空)* | 本地通道（含 Chromium 续期）的单个或多个出口代理 URL |
+| — | `GLENS_ALLOW_FAKE_IP` | `0` | 仅本机 Clash Fake-IP 调试用：设为 `1` 时放行 `198.18.0.0/15` |
+| — | `GLENS_LOG_LEVEL` | `INFO` | 服务端日志级别（`DEBUG` / `INFO` / `WARNING` / `ERROR`） |
+| — | `GLENS_LOG_FILE` | `/data/logs/glens.log` (Docker) | 轮转日志文件路径（为空时仅输出到 stderr） |
+| — | `GLENS_LOG_MAX_BYTES` | `20971520` | 单个日志文件上限（默认 20 MiB） |
+| — | `GLENS_LOG_BACKUP_COUNT` | `5` | 日志轮转保留的历史文件份数 |
 
 ### 语言偏好设置
 
