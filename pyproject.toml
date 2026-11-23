@@ -43,6 +43,7 @@ server = [
     "uvicorn>=0.30",
     "urllib3>=2.2",
     "Pillow>=10.4",
+    "curl-cffi>=0.7",
 ]
 # Test/lint tooling; the suite needs no network and no browser.
 dev = [

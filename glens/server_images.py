@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 from io import BytesIO
 from urllib.parse import urljoin
@@ -14,7 +15,10 @@ from urllib3.util import parse_url
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_PROXY_IMAGE_BYTES = 3_500 * 1024
+DEFAULT_MAX_IMAGE_EDGE = 1024
+_NORMALIZE_SKIP_BYTES = 256 * 1024
 _REDIRECTS = {301, 302, 303, 307, 308}
+_FAKE_IP_NETWORK = ipaddress.IPv4Network("198.18.0.0/15")
 
 
 class APIError(Exception):
@@ -38,6 +42,62 @@ def validate_image(data: bytes) -> None:
             picture.verify()
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
         raise APIError(415, "invalid_image", "Expected a readable image file.") from exc
+
+
+def _max_image_edge() -> int:
+    raw = os.getenv("GLENS_MAX_IMAGE_EDGE", "").strip()
+    if not raw:
+        return DEFAULT_MAX_IMAGE_EDGE
+    try:
+        value = int(raw)
+        return 0 if value <= 0 else max(64, value)
+    except ValueError:
+        return DEFAULT_MAX_IMAGE_EDGE
+
+
+def normalize_image_for_lens(
+    data: bytes,
+    *,
+    max_edge: int | None = None,
+    quality: int = 82,
+) -> bytes:
+    """Resize oversized uploads and encode as compact RGB JPEG for faster Lens uploads.
+
+    Already-compact images within ``max_edge`` and 256 KiB are returned untouched
+    so small inputs avoid unnecessary re-encoding.
+    """
+    edge = _max_image_edge() if max_edge is None else max_edge
+    if edge <= 0:
+        return data
+    try:
+        with Image.open(BytesIO(data)) as source:
+            width, height = source.size
+            if max(width, height) <= edge and len(data) <= _NORMALIZE_SKIP_BYTES:
+                return data
+            image = ImageOps.exif_transpose(source)
+            image.load()
+            if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise APIError(415, "invalid_image", "Expected a readable image file.") from exc
+
+    longest = max(image.width, image.height)
+    if longest > edge:
+        scale = edge / longest
+        size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+        image = image.resize(size, Image.Resampling.LANCZOS)
+
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=quality, optimize=True)
+    normalized = output.getvalue()
+    if len(normalized) >= len(data) and longest <= edge:
+        return data
+    return normalized
 
 
 def compress_image_for_proxy(data: bytes) -> bytes:
@@ -72,12 +132,19 @@ def compress_image_for_proxy(data: bytes) -> bytes:
                    "The image could not be compressed to the Vercel proxy size limit.")
 
 
+def _allow_fake_ip() -> bool:
+    return os.getenv("GLENS_ALLOW_FAKE_IP", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _public_address(value: str) -> bool:
     ip = ipaddress.ip_address(value)
     if isinstance(ip, ipaddress.IPv6Address):
         # Exclude scoped and transition addresses that can reach an embedded IPv4 target.
         if ip not in ipaddress.IPv6Network("2000::/3") or ip.sixtofour or ip.teredo:
             return False
+    elif ip in _FAKE_IP_NETWORK and _allow_fake_ip():
+        # Optional local-dev support for transparent proxy Fake-IP DNS (RFC 2544, 198.18.0.0/15).
+        return True
     return ip.is_global and not ip.is_multicast and not ip.is_reserved
 
 

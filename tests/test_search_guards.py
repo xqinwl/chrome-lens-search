@@ -402,6 +402,25 @@ def test_missing_browser_extra_warns_loudly(tmp_path, caplog):
     assert warnings and "browser backend unavailable" in warnings[0].getMessage()
 
 
+def test_upload_aborts_immediately_on_sorry_redirect():
+    driver = UploadDriver("https://www.google.com/sorry/index?continue=https://lens.google.com/")
+    with pytest.raises(lens_mod.LensBotChallengeError) as exc:
+        lens_mod._upload_to_google(driver, b"img", 25)
+    assert "/sorry/" in (exc.value.challenge_url or "")
+
+
+def test_bot_challenge_in_auto_mode_never_launches_browser(monkeypatch, tmp_path):
+    def challenge(*args, **kwargs):
+        raise lens_mod.LensBotChallengeError("https://www.google.com/sorry/index")
+
+    def explode(*args, **kwargs):
+        raise AssertionError("browser must not launch after a bot challenge")
+
+    monkeypatch.setattr(lens_mod, "_search_via_requests", challenge)
+    monkeypatch.setattr(lens_mod, "_search_via_browser", explode)
+    assert glens.search(b"img", backend="auto", cookie_file=tmp_path / "jar.json") is None
+
+
 def test_explicit_empty_browser_page_is_a_confirmed_miss(monkeypatch, tmp_path):
     class EmptyPage(FakeDriver):
         current_url = RESULTS_URL

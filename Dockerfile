@@ -14,7 +14,13 @@ RUN pip install --no-cache-dir ".[server,browser]"
 
 ENV GLENS_BACKEND=auto \
     GLENS_COOKIE_FILE=/data/cookies.json \
+    GLENS_CACHE=1 \
     GLENS_CACHE_DIR=/data/results \
+    GLENS_CHROME_PROFILE=/data/chrome-profile \
+    GLENS_HEADLESS=0 \
+    GLENS_PROXY_FALLBACK=1 \
+    GLENS_MAX_IMAGE_EDGE=1024 \
+    GLENS_RESOLVE_MAX=5 \
     GLENS_CHROMIUM_PATH=/usr/bin/chromium \
     GLENS_CHROMEDRIVER_PATH=/home/glens/chromedriver
 USER glens

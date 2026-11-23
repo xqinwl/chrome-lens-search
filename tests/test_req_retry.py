@@ -128,14 +128,109 @@ def test_http_error_does_not_retry(monkeypatch, jar_file):
 
 
 def test_non_results_redirect_falls_back(monkeypatch, jar_file):
-    # Upload redirected somewhere that is neither udm=26 nor a lens URL.
-    session = FlakySession(fail_first=0, url="https://www.google.com/sorry/index")
+    # Upload redirected somewhere that is neither udm=26, lens, nor a bot challenge.
+    session = FlakySession(fail_first=0, url="https://www.google.com/webhp")
     monkeypatch.setattr(lens_mod, "_req_session", lambda jar, lang=None: session)
 
     items, url = lens_mod._search_via_requests(b"img", jar_file)
 
     assert session.posts == 1
     assert items is None and url is None
+
+
+def test_sorry_redirect_raises_bot_challenge_without_retry(monkeypatch, jar_file):
+    session = FlakySession(fail_first=0, url="https://www.google.com/sorry/index")
+    monkeypatch.setattr(lens_mod, "_req_session", lambda jar, lang=None: session)
+
+    with pytest.raises(lens_mod.LensBotChallengeError) as exc:
+        lens_mod._search_via_requests(b"img", jar_file)
+
+    assert session.posts == 1
+    assert exc.value.challenge_url == "https://www.google.com/sorry/index"
+
+
+def test_captcha_html_raises_bot_challenge(monkeypatch, jar_file):
+    captcha_html = (
+        '<html><body><form id="captcha-form">Our systems have detected unusual traffic '
+        'from your computer network.</form></body></html>'
+    )
+    session = FlakySession(fail_first=0, url=RESULTS_URL, html=captcha_html)
+    monkeypatch.setattr(lens_mod, "_req_session", lambda jar, lang=None: session)
+
+    with pytest.raises(lens_mod.LensBotChallengeError):
+        lens_mod._search_via_requests(b"img", jar_file)
+
+    assert session.posts == 1
+
+
+def test_req_rolls_updated_cookies_to_disk(monkeypatch, jar_file):
+    session = FlakySession(fail_first=0, html=SYNTHETIC_RESULTS_HTML)
+    session.cookies = requests.cookies.RequestsCookieJar()
+    session.cookies.set("TEST", "1", domain=".google.com", path="/")
+    session.cookies.set("NID", "rotated-token", domain=".google.com", path="/")
+    monkeypatch.setattr(lens_mod, "_req_session", lambda jar, lang=None: session)
+
+    items, url = lens_mod._search_via_requests(b"img", jar_file)
+
+    assert items is not None and url == RESULTS_URL
+    saved = json.loads(jar_file.read_text(encoding="utf-8"))
+    by_name = {c["name"]: c["value"] for c in saved["cookies"]}
+    assert by_name["TEST"] == "1"
+    assert by_name["NID"] == "rotated-token"
+
+
+def test_curl_cffi_session_shim_handles_multipart_and_cookies(monkeypatch):
+    seen = {}
+
+    class FakeInnerCookies:
+        def __init__(self):
+            self.items = []
+
+        def set(self, name, value, domain=None, path=None):
+            self.items.append(type("C", (), {
+                "name": name, "value": value, "domain": domain, "path": path
+            })())
+
+        def __iter__(self):
+            return iter(self.items)
+
+    class FakeInnerSession:
+        def __init__(self, impersonate=None):
+            seen["impersonate"] = impersonate
+            self.cookies = FakeInnerCookies()
+            self.closed = False
+
+        def post(self, url, **kwargs):
+            seen["post"] = (url, kwargs)
+            self.cookies.set("NID", "from-cffi", domain=".google.com", path="/")
+            return type("R", (), {
+                "status_code": 200, "url": RESULTS_URL,
+                "text": SYNTHETIC_RESULTS_HTML, "headers": {},
+            })()
+
+        def close(self):
+            self.closed = True
+
+    fake_cffi = type("FakeCffi", (), {"Session": FakeInnerSession})
+    monkeypatch.setattr(lens_mod, "_load_curl_cffi", lambda: fake_cffi)
+
+    jar = {"user_agent": "Chrome/149.0.0.0", "cookies": []}
+    session = lens_mod._req_session(jar, local_proxy="http://127.0.0.1:7897")
+    resp = session.post(
+        lens_mod._UPLOAD_ENDPOINT,
+        files={"encoded_image": ("frame.jpg", b"jpeg-bytes", "image/jpeg")},
+        data={"sbisrc": "Google Chrome"},
+    )
+    resp.raise_for_status()
+    session.close()
+
+    assert seen["impersonate"] == "chrome"
+    url, kwargs = seen["post"]
+    assert url == lens_mod._UPLOAD_ENDPOINT
+    assert "multipart/form-data; boundary=" in kwargs["headers"]["Content-Type"]
+    assert b"jpeg-bytes" in kwargs["data"]
+    assert kwargs["proxies"] == {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
+    assert session.cookies.get("NID") == "from-cffi"
 
 
 def test_degraded_page_with_few_external_anchors_falls_back(monkeypatch, jar_file):

@@ -40,13 +40,19 @@ def _parse_browser_major(message: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def build_driver(*, headless: bool | None = None, user_data_dir: str | os.PathLike | None = None):
+def build_driver(
+    *,
+    headless: bool | None = None,
+    user_data_dir: str | os.PathLike | None = None,
+    proxy: str | None = None,
+):
     """Build a stealthy Chrome via undetected-chromedriver.
 
     A persistent ``user_data_dir`` is recommended: it lets the JS-verified session
     survive across runs, so the cookie jar stays fresh and the fast ``req`` path
     keeps working without re-launching Chrome. Set ``GLENS_CHROME_PROFILE`` to pick
-    one up from the environment.
+    one up from the environment, and ``GLENS_PROXY`` (or ``proxy=``) to pin Chrome
+    to the same outbound proxy as the HTTP backend.
     """
     try:
         import undetected_chromedriver as uc
@@ -88,9 +94,15 @@ def build_driver(*, headless: bool | None = None, user_data_dir: str | os.PathLi
 
     if headless is None:
         headless = _env_flag("GLENS_HEADLESS", True)
+    if not headless and platform.system() == "Linux" and not os.getenv("DISPLAY"):
+        logger.warning("glens: DISPLAY is unset on Linux; falling back to headless Chrome.")
+        headless = True
     if user_data_dir is None:
         env_profile = os.getenv("GLENS_CHROME_PROFILE", "").strip()
         user_data_dir = env_profile or None
+    if proxy is None:
+        env_proxy = os.getenv("GLENS_PROXY", "").strip()
+        proxy = env_proxy or None
 
     def make_options():  # uc mutates options; each attempt needs a fresh object
         options = uc.ChromeOptions()
@@ -101,8 +113,18 @@ def build_driver(*, headless: bool | None = None, user_data_dir: str | os.PathLi
         if headless:
             options.add_argument("--headless=new")
         if user_data_dir:
-            Path(user_data_dir).mkdir(parents=True, exist_ok=True)
-            options.add_argument(f"--user-data-dir={user_data_dir}")
+            profile_path = Path(user_data_dir)
+            profile_path.mkdir(parents=True, exist_ok=True)
+            # Clear stale Chromium lockfiles left behind by container rebuilds
+            # (hostname changes across Docker recreations) or killed processes.
+            for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                try:
+                    (profile_path / lock_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            options.add_argument(f"--user-data-dir={profile_path}")
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
         return options
 
     driver_path = os.getenv("GLENS_CHROMEDRIVER_PATH")

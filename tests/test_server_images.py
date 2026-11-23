@@ -82,3 +82,44 @@ def test_compress_image_for_proxy_keeps_payload_within_budget():
     assert len(compressed) <= images.MAX_PROXY_IMAGE_BYTES
     with Image.open(BytesIO(compressed)) as result:
         assert result.format == "JPEG"
+
+
+def test_normalize_image_for_lens_resizes_large_images():
+    from io import BytesIO
+
+    from PIL import Image
+
+    large = Image.new("RGBA", (2400, 1200), (40, 120, 200, 255))
+    buf = BytesIO()
+    large.save(buf, format="PNG")
+    source = buf.getvalue()
+
+    normalized = images.normalize_image_for_lens(source, max_edge=1024)
+    with Image.open(BytesIO(normalized)) as out:
+        assert out.format == "JPEG"
+        assert max(out.size) == 1024
+        assert out.size == (1024, 512)
+
+
+def test_normalize_image_for_lens_leaves_tiny_images_untouched():
+    from glens import lens
+
+    tiny = lens._tiny_png()
+    assert images.normalize_image_for_lens(tiny, max_edge=1024) == tiny
+    assert images.normalize_image_for_lens(tiny, max_edge=0) == tiny
+
+
+def test_fake_ip_opt_in_only_allows_198_18_range(monkeypatch):
+    monkeypatch.delenv("GLENS_ALLOW_FAKE_IP", raising=False)
+    assert images._public_address("198.18.1.156") is False
+
+    monkeypatch.setenv("GLENS_ALLOW_FAKE_IP", "1")
+    assert images._public_address("198.18.1.156") is True
+    assert images._public_address("198.19.255.1") is True
+    # Loopback, private RFC1918, and cloud metadata IPs stay strictly blocked.
+    assert images._public_address("127.0.0.1") is False
+    assert images._public_address("10.0.0.1") is False
+    assert images._public_address("192.168.1.1") is False
+    assert images._public_address("169.254.169.254") is False
+    assert images._public_address("::1") is False
+

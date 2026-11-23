@@ -69,9 +69,11 @@ Compose 根据宿主机架构构建 Linux AMD64 或 ARM64 镜像，内置 Chromi
 
 如果 Docker DNS 将图片域名解析成 Clash Fake-IP 地址（例如 `198.18.x.x`），需要让 Clash 对该域名返回真实公网地址。在 Clash Verge 配置中，将 `cdn.globus.pictures` 加入 `dns.fake-ip-filter`。如果还希望该 CDN 直连，再在兜底代理规则前添加 `DOMAIN,cdn.globus.pictures,DIRECT`。修改 DNS 规则后重建容器，让它重新解析域名。API 会拒绝虚拟、内网和保留 IP，这是服务端防止请求伪造的安全校验。
 
-requests 后端支持独立搜索并发，HTTP API 不额外设置并发上限；实际吞吐受 Python worker pool 和可用资源影响。浏览器回退和会话刷新仍会串行执行，以保护共享的 Chrome 配置和 Cookie 文件。错误格式为 `{"error":{"code":"…","message":"…"}}`。413 表示请求过大，415 表示内容格式不受支持，422 表示输入无效。HTTP 429 `upstream_rate_limited` 表示 Google Lens 明确返回了 429（若 Google 提供 `Retry-After`，响应会带上该头）。502 的错误码区分图片下载失败（`image_download_failed`）与 Lens 查询失败或结果无法判断（`lens_lookup_failed`）。
+requests 后端支持独立搜索并发，服务端内置路由池（`RoutePool`）与控频熔断机制。错误格式为 `{"error":{"code":"…","message":"…"}}`。413 表示请求过大，415 表示内容格式不受支持，422 表示输入无效。HTTP 429 `upstream_rate_limited` 表示 Google Lens 触发了 429 限流或所有可用出口到达速率上限；HTTP 503 `upstream_bot_challenge` 表示所有可用出口均触发了 Google `/sorry` 机器人检测并进入熔断冷却（两者均会返回 `Retry-After` 头，避免继续撞墙）。502 的错误码区分图片下载失败（`image_download_failed`）与 Lens 查询失败或结果无法判断（`lens_lookup_failed`）。成功响应会附带 `X-Glens-Route` 响应头（如 `cache-l1`、`cache-l2`、`vercel-0`、`local-0`），便于观测缓存命中与路由分流情况。
 
-要通过 Vercel 代理搜索，设置 `GLENS_VERCEL_PROXY_URL` 和 `GLENS_VERCEL_PROXY_SECRET`，并在 JSON 请求中传 `"proxy":"vercel"`。代理模式只接受 `image_url`，复用本地已建立的 Google Cookie，不可用时直接返回错误且不会回退 Chrome；结果缓存会跳过，确保请求确实经过代理。超出 Vercel 请求体预算的图片会转成 JPEG 并压缩。`GLENS_VERCEL_PROXY_SECRET` 必须与 Vercel 项目的 `CRON_SECRET` 一致。
+要通过 Vercel 代理搜索，设置 `GLENS_VERCEL_PROXY_URL`（或逗号分隔的多个区域地址 `GLENS_VERCEL_PROXY_URLS`）和 `GLENS_VERCEL_PROXY_SECRET`，并在 JSON 请求中传 `"proxy":"vercel"`。Docker 部署默认开启 `GLENS_PROXY_FALLBACK=1` 与两级本地缓存（`GLENS_CACHE=1`，含 SHA-256 精确匹配、dHash 近似图去重与同图并发合并）：请求优先走健康的 Vercel 路由并受 `GLENS_VERCEL_RPM` 控频保护；当 Vercel 触发 `/sorry`、429、代理异常或达到单路速率上限时，会自动熔断冷却并无缝分流/降级到本地容器通道（支持 `curl_cffi` HTTP/2 指纹、持久化 Chrome Profile 与按路由隔离的 Cookie 滚动回写）。若需严格禁止回退，可将 `GLENS_PROXY_FALLBACK=0`。所有上传图片默认按长边 `GLENS_MAX_IMAGE_EDGE=1024` 归一化为紧凑 JPEG；如需进一步横向扩容吞吐，可直接通过 `GLENS_VERCEL_PROXY_URLS` 或 `GLENS_LOCAL_PROXIES` 配置多出口，无需改代码。
+
+运维接口：`GET /v1/pool/status` 查看各路由状态、剩余冷却时间、近 1 分钟请求数与缓存命中统计；`POST /v1/warmup`（可选传 `{"slot_id": null, "reset_cooldown": true, "force": true}`）可在不重启容器的情况下重置冷却并刷新会话。
 
 从源码直接运行可使用 `pip install ".[server,browser]"` 和 `glens serve`，默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 调整。
 

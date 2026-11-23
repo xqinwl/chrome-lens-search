@@ -37,11 +37,9 @@ if you need precision.
 from __future__ import annotations
 
 import base64
-import hashlib
 import importlib.util
 import json
 import logging
-import math
 import os
 import re
 import struct
@@ -58,6 +56,8 @@ from typing import Callable
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
+
+from . import cache as _cache_mod
 
 logger = logging.getLogger("glens")
 
@@ -93,6 +93,7 @@ DEFAULT_RESULT_TIMEOUT = _env_int("GLENS_RESULT_TIMEOUT", 25, minimum=5)
 DEFAULT_LANG = os.getenv("GLENS_LANG", "").strip() or None
 DEFAULT_USE_CACHE = _env_flag("GLENS_CACHE")
 DEFAULT_CACHE_TTL = _env_int("GLENS_CACHE_TTL", 86400)
+DEFAULT_RESOLVE_MAX = _env_int("GLENS_RESOLVE_MAX", 5, minimum=1)
 
 _VALID_BACKENDS = ("auto", "req", "browser")
 _REQ_ATTEMPTS = 2
@@ -110,10 +111,7 @@ def _default_cookie_file() -> Path:
 
 
 def _default_cache_dir() -> Path:
-    env = os.getenv("GLENS_CACHE_DIR", "").strip()
-    if env:
-        return Path(env)
-    return Path.home() / ".cache" / "glens" / "results"
+    return _cache_mod.default_cache_dir()
 
 
 # Lens' own upload endpoint. The old reverse-image-search one
@@ -157,6 +155,7 @@ _BARE_DOMAIN = re.compile(
 _EMBEDDED_URL = re.compile(r"\s*(?:https?://|www\.)\S*.*$", re.IGNORECASE)
 
 _browser_lock = threading.Lock()
+_cookie_io_lock = threading.Lock()
 _VERCEL_PROXY_HEADER = "x-glens-proxy-upstream"
 _VERCEL_PROXY_BODY_LIMIT = 4 * 1024 * 1024
 
@@ -167,6 +166,15 @@ class LensRateLimitError(RuntimeError):
     def __init__(self, retry_after: str | None = None):
         super().__init__("Google Lens rate limited the request.")
         self.retry_after = retry_after
+
+
+class LensBotChallengeError(RuntimeError):
+    """Google Lens intercepted the request with a bot/CAPTCHA challenge."""
+
+    def __init__(self, challenge_url: str | None = None, reason: str = "bot_challenge"):
+        super().__init__("Google Lens presented a bot challenge.")
+        self.challenge_url = challenge_url
+        self.reason = reason
 
 
 class LensProxyError(RuntimeError):
@@ -194,7 +202,10 @@ class _VercelProxyAdapter(requests.adapters.BaseAdapter):
             _ = target.port
             if (target.scheme not in {"http", "https"} or not target.hostname
                     or target.username or target.password):
-                raise LensProxyError("proxy_target_rejected", "Proxy target must be an HTTP(S) URL.")
+                raise LensProxyError(
+                    "proxy_target_rejected",
+                    "Proxy target must be an HTTP(S) URL.",
+                )
             body = request.body
             if body is not None and not isinstance(body, bytes):
                 raise LensProxyError("proxy_request_invalid", "Proxy request body must be bytes.")
@@ -421,6 +432,36 @@ def _domain_of(href: str) -> str:
 _UPLOAD_PATH = urlparse(_UPLOAD_ENDPOINT).path.rstrip("/")
 
 
+_BOT_CHALLENGE_HTML_MARKERS = (
+    'id="captcha-form"',
+    "id='captcha-form'",
+    'class="g-recaptcha"',
+    "class='g-recaptcha'",
+    "our systems have detected unusual traffic",
+    "detected unusual traffic from your computer",
+    "google.com/sorry/index",
+)
+
+
+def _is_bot_challenge(url: str = "", html: str = "") -> bool:
+    """True when Google redirected to /sorry or served a CAPTCHA challenge page."""
+    if url and "://" in url:
+        try:
+            parts = urlparse(url)
+            host = (parts.hostname or "").lower().removeprefix("www.")
+            if _is_google_host(host) and (
+                host.startswith("sorry.") or parts.path.startswith("/sorry")
+            ):
+                return True
+        except Exception:
+            pass
+    if html:
+        low = html.lower()
+        if any(marker in low for marker in _BOT_CHALLENGE_HTML_MARKERS):
+            return True
+    return False
+
+
 def _looks_like_results_url(url: str) -> bool:
     """True when a URL is the Lens results page both backends are waiting for.
 
@@ -571,62 +612,40 @@ def _tiny_png() -> bytes:
 # header (see _req_session); country/market always follows your IP.
 
 
-# Opt-in result cache: sha256(image)+lang -> harvested anchors. Shaping
-# (max_matches/max_titles) is applied per call, so it never keys the cache.
+# Opt-in result cache: sha256(image)+lang -> harvested anchors, plus L2 dHash
+# near-duplicate lookup. Shaping (max_matches/max_titles) is applied per call.
 def _cache_key(frame_bytes: bytes, lang: str | None) -> str:
-    digest = hashlib.sha256(frame_bytes)
-    digest.update(f"|{lang or ''}".encode())
-    return digest.hexdigest()
+    return _cache_mod.cache_key(frame_bytes, lang)
 
 
 def _cache_read(key: str, ttl: int) -> tuple[list[dict], str | None] | None:
-    try:
-        path = _default_cache_dir() / f"{key}.json"
-        if not path.exists():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        saved_at = float(data.get("saved_at", 0))
-        if not math.isfinite(saved_at) or time.time() - saved_at > ttl:
-            return None
-        items = data.get("items")
-        if not isinstance(items, list) or not items or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("href"), str)
-            or not isinstance(item.get("text"), str)
-            for item in items
-        ):
-            return None
-        results_url = data.get("results_url")
-        if results_url is not None and not isinstance(results_url, str):
-            return None
-        logger.info("glens: result cache hit (%s...)", key[:12])
-        return items, results_url
-    except Exception:
-        return None  # unreadable/corrupt cache entries are simply misses
+    return _cache_mod.cache_read(key, ttl, cache_dir=_default_cache_dir())
 
 
-def _cache_write(key: str, items: list[dict], results_url: str | None) -> None:
-    tmp: Path | None = None
-    try:
-        cache_dir = _default_cache_dir()
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        # Write-then-rename so concurrent writers can't leave a torn entry.
-        # pid AND thread id: concurrent searches for the same image+lang need
-        # distinct tmp paths so one writer cannot rename another's partial file.
-        tmp = cache_dir / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
-        tmp.write_text(
-            json.dumps({"saved_at": time.time(), "results_url": results_url, "items": items}),
-            encoding="utf-8",
-        )
-        tmp.replace(cache_dir / f"{key}.json")
-        tmp = None
-    except Exception as exc:
-        logger.info("glens: could not write the result cache (%s)", exc)
-    finally:
-        # A failed rename must not strand the temp file. On Windows the rename
-        # genuinely loses races (two threads publishing the same key), and the
-        # cache is never swept, so every loss used to leak a file forever.
-        _discard(tmp)
+def _cache_read_dhash(
+    dhash: int | None,
+    lang: str | None,
+    ttl: int,
+) -> tuple[list[dict], str | None] | None:
+    return _cache_mod.cache_read_dhash(dhash, lang, ttl, cache_dir=_default_cache_dir())
+
+
+def _cache_write(
+    key: str,
+    items: list[dict],
+    results_url: str | None,
+    *,
+    dhash: int | None = None,
+    lang: str | None = None,
+) -> None:
+    _cache_mod.cache_write(
+        key,
+        items,
+        results_url,
+        dhash=dhash,
+        lang=lang,
+        cache_dir=_default_cache_dir(),
+    )
 
 
 def _discard(path: Path | None) -> None:
@@ -656,22 +675,153 @@ def _save_cookie_jar(driver, cookie_file: Path) -> None:
         if not cookies:
             return
         ua = driver.execute_script("return navigator.userAgent") or _REQ_UA_FALLBACK
-        cookie_file.parent.mkdir(parents=True, exist_ok=True)
-        # Write-then-rename: a crash or a full disk mid-write would otherwise
-        # truncate the jar in place, and a half-written jar is unloadable --
-        # taking out the working fast path this run was only meant to refresh.
-        tmp = cookie_file.with_name(
-            f"{cookie_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
-        tmp.write_text(
-            json.dumps({"user_agent": ua, "cookies": cookies, "minted_at": time.time()}),
-            encoding="utf-8",
-        )
-        tmp.replace(cookie_file)
+        with _cookie_io_lock:
+            cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            # Write-then-rename: a crash or a full disk mid-write would otherwise
+            # truncate the jar in place, and a half-written jar is unloadable --
+            # taking out the working fast path this run was only meant to refresh.
+            tmp = cookie_file.with_name(
+                f"{cookie_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            tmp.write_text(
+                json.dumps({"user_agent": ua, "cookies": cookies, "minted_at": time.time()}),
+                encoding="utf-8",
+            )
+            tmp.replace(cookie_file)
+            tmp = None
         logger.info("glens: saved %d google.com cookie(s) for the req backend.", len(cookies))
     except Exception as exc:
         logger.info("glens: could not save the cookie jar (%s).", exc)
         _discard(tmp)
+
+
+def _iter_google_cookies(session_cookies) -> list[dict]:
+    """Extract google.com cookie dicts from a cookie jar or list."""
+    extracted: list[dict] = []
+    if session_cookies is None:
+        return extracted
+    jar = getattr(session_cookies, "jar", session_cookies)
+    if isinstance(jar, list):
+        for item in jar:
+            if (isinstance(item, dict) and isinstance(item.get("name"), str)
+                    and item["name"] and isinstance(item.get("value"), str)):
+                domain = item.get("domain") or ".google.com"
+                if _is_google_host(str(domain)):
+                    extracted.append({
+                        "name": item["name"],
+                        "value": item["value"],
+                        "domain": str(domain),
+                        "path": str(item.get("path") or "/"),
+                    })
+        return extracted
+    try:
+        for cookie in jar:
+            name = getattr(cookie, "name", None)
+            value = getattr(cookie, "value", None)
+            if not isinstance(name, str) or not name or not isinstance(value, str):
+                continue
+            domain = getattr(cookie, "domain", None) or ".google.com"
+            path = getattr(cookie, "path", None) or "/"
+            if _is_google_host(str(domain)):
+                extracted.append({
+                    "name": name,
+                    "value": value,
+                    "domain": str(domain),
+                    "path": str(path),
+                })
+    except TypeError:
+        return extracted
+    return extracted
+
+
+def _merge_and_save_cookies(
+    cookie_file: Path,
+    session_cookies,
+    user_agent: str | None = None,
+) -> bool:
+    """Merge refreshed google.com Set-Cookie values back into ``cookie_file``.
+
+    Only writes to disk when at least one cookie was added or updated, keeping
+    the hot path disk-quiet when Google didn't rotate any session cookies.
+    """
+    incoming = _iter_google_cookies(session_cookies)
+    if not incoming:
+        return False
+    tmp: Path | None = None
+    try:
+        with _cookie_io_lock:
+            existing_jar = _load_cookie_jar(cookie_file) or {}
+            existing_list = existing_jar.get("cookies") or []
+            existing_map: dict[tuple[str, str, str], dict] = {}
+            for c in existing_list:
+                key = (c["name"], c.get("domain") or ".google.com", c.get("path") or "/")
+                existing_map[key] = {
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": key[1],
+                    "path": key[2],
+                }
+            merged_map = dict(existing_map)
+            for c in incoming:
+                key = (c["name"], c["domain"], c["path"])
+                merged_map[key] = c
+            if merged_map == existing_map:
+                return False
+            payload = {
+                "user_agent": existing_jar.get("user_agent") or user_agent or _REQ_UA_FALLBACK,
+                "cookies": list(merged_map.values()),
+                "minted_at": existing_jar.get("minted_at") or time.time(),
+                "updated_at": time.time(),
+            }
+            cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cookie_file.with_name(
+                f"{cookie_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(cookie_file)
+            tmp = None
+        logger.info("glens: rolled %d google.com cookie(s) to %s.", len(merged_map), cookie_file)
+        return True
+    except Exception as exc:
+        logger.info("glens: could not roll cookies to %s (%s).", cookie_file, exc)
+        _discard(tmp)
+        return False
+
+
+def _ensure_route_cookie_file(route_cookie: Path, seed_cookie: Path | None) -> Path:
+    """Ensure a route-isolated cookie file exists and stays in sync with newer re-mints."""
+    if seed_cookie is None or route_cookie == seed_cookie:
+        return route_cookie
+    seed = _load_cookie_jar(seed_cookie)
+    if seed is None:
+        return route_cookie
+    existing = _load_cookie_jar(route_cookie)
+    if existing is not None:
+        # Only re-seed if the base cookie jar was freshly re-minted after this route's jar.
+        seed_minted = float(seed.get("minted_at") or 0)
+        route_minted = float(existing.get("minted_at") or 0)
+        if seed_minted <= route_minted:
+            return route_cookie
+    tmp: Path | None = None
+    try:
+        with _cookie_io_lock:
+            existing = _load_cookie_jar(route_cookie)
+            if existing is not None:
+                seed_minted = float(seed.get("minted_at") or 0)
+                route_minted = float(existing.get("minted_at") or 0)
+                if seed_minted <= route_minted:
+                    return route_cookie
+            route_cookie.parent.mkdir(parents=True, exist_ok=True)
+            tmp = route_cookie.with_name(
+                f"{route_cookie.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            tmp.write_text(json.dumps(seed), encoding="utf-8")
+            tmp.replace(route_cookie)
+            tmp = None
+    except Exception as exc:
+        logger.info("glens: could not seed route cookie file %s (%s).", route_cookie, exc)
+        _discard(tmp)
+    return route_cookie
 
 
 def _load_cookie_jar(cookie_file: Path) -> dict | None:
@@ -721,28 +871,174 @@ def _ua_platform(user_agent: str) -> str:
     return "Windows"
 
 
-def _req_session(jar: dict, lang: str | None = None,
-                 proxy: str | None = None) -> requests.Session:
-    session = requests.Session()
+def _load_curl_cffi():
+    """Return curl_cffi.requests when installed and not explicitly disabled."""
+    raw = os.getenv("GLENS_USE_CURL_CFFI")
+    if raw is not None and raw.strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    try:
+        from curl_cffi import requests as cffi_requests
+        return cffi_requests
+    except ImportError:
+        return None
+
+
+class _CurlCffiResponse:
+    """Thin requests.Response-compatible wrapper around a curl_cffi response."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.status_code = int(getattr(inner, "status_code", 200))
+        self.url = str(getattr(inner, "url", "") or "")
+        self.text = getattr(inner, "text", "") or ""
+        self.headers = requests.structures.CaseInsensitiveDict(
+            dict(getattr(inner, "headers", {}) or {})
+        )
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            err_resp = requests.Response()
+            err_resp.status_code = self.status_code
+            err_resp.url = self.url
+            err_resp.headers.update(self.headers)
+            err_resp._content = self.text.encode("utf-8", errors="replace")
+            raise requests.HTTPError(
+                f"{self.status_code} error for url: {self.url}",
+                response=err_resp,
+            )
+
+
+class _CurlCffiSession:
+    """Drop-in requests.Session shim backed by curl_cffi (Chrome BoringSSL + HTTP/2)."""
+
+    def __init__(self, cffi_requests, impersonate: str = "chrome"):
+        self._inner = cffi_requests.Session(impersonate=impersonate)
+        self.headers = requests.structures.CaseInsensitiveDict()
+        self.cookies = requests.cookies.RequestsCookieJar()
+        self.proxies: dict[str, str] = {}
+
+    def _sync_cookies_to_inner(self) -> None:
+        inner_cookies = getattr(self._inner, "cookies", None)
+        if inner_cookies is None:
+            return
+        for cookie in self.cookies:
+            try:
+                inner_cookies.set(
+                    cookie.name,
+                    cookie.value,
+                    domain=cookie.domain or ".google.com",
+                    path=cookie.path or "/",
+                )
+            except Exception:
+                continue
+
+    def _sync_cookies_from_inner(self) -> None:
+        for item in _iter_google_cookies(getattr(self._inner, "cookies", None)):
+            try:
+                self.cookies.set(
+                    item["name"],
+                    item["value"],
+                    domain=item["domain"],
+                    path=item["path"],
+                )
+            except Exception:
+                continue
+
+    def _encode_multipart(self, files: dict, data: dict | None) -> tuple[bytes, str]:
+        from urllib3.filepost import encode_multipart_formdata
+
+        fields: list[tuple[str, object]] = []
+        for k, v in (data or {}).items():
+            fields.append((k, str(v)))
+        for k, v in files.items():
+            fields.append((k, v))
+        return encode_multipart_formdata(fields)
+
+    def _request(self, method: str, url: str, *, files=None, data=None,
+                 timeout=30, allow_redirects=True, headers=None):
+        self._sync_cookies_to_inner()
+        req_headers = dict(self.headers)
+        if headers:
+            req_headers.update(headers)
+        payload = data
+        if files is not None:
+            payload, content_type = self._encode_multipart(files, data)
+            req_headers["Content-Type"] = content_type
+        kwargs: dict = {
+            "headers": req_headers,
+            "timeout": timeout,
+            "allow_redirects": allow_redirects,
+        }
+        if payload is not None:
+            kwargs["data"] = payload
+        if self.proxies:
+            kwargs["proxies"] = self.proxies
+        try:
+            resp = getattr(self._inner, method)(url, **kwargs)
+        except requests.RequestException:
+            raise
+        except Exception as exc:
+            raise requests.RequestException(str(exc)) from exc
+        self._sync_cookies_from_inner()
+        return _CurlCffiResponse(resp)
+
+    def post(self, url: str, *, files=None, data=None, timeout=30,
+             allow_redirects=True, headers=None):
+        return self._request(
+            "post", url, files=files, data=data,
+            timeout=timeout, allow_redirects=allow_redirects, headers=headers,
+        )
+
+    def get(self, url: str, *, timeout=30, allow_redirects=True, headers=None):
+        return self._request(
+            "get", url, timeout=timeout,
+            allow_redirects=allow_redirects, headers=headers,
+        )
+
+    def close(self) -> None:
+        try:
+            self._inner.close()
+        except Exception:
+            pass
+
+
+def _req_session(
+    jar: dict,
+    lang: str | None = None,
+    proxy: str | None = None,
+    *,
+    proxy_url: str | None = None,
+    proxy_secret: str | None = None,
+    local_proxy: str | None = None,
+):
     if proxy is not None:
+        session = requests.Session()
         if proxy != "vercel":
             session.close()
             raise ValueError("proxy must be None or 'vercel'")
-        proxy_url = os.getenv("GLENS_VERCEL_PROXY_URL", "").strip()
-        proxy_secret = os.getenv("GLENS_VERCEL_PROXY_SECRET", "")
-        if not proxy_url or not proxy_secret:
+        resolved_url = (proxy_url if proxy_url is not None
+                        else os.getenv("GLENS_VERCEL_PROXY_URL", "")).strip()
+        resolved_secret = (proxy_secret if proxy_secret is not None
+                           else os.getenv("GLENS_VERCEL_PROXY_SECRET", ""))
+        if not resolved_url or not resolved_secret:
             session.close()
             raise LensProxyError("proxy_not_configured",
                                  "Vercel proxy URL and secret must be configured.")
-        parsed_proxy_url = urlparse(proxy_url)
+        parsed_proxy_url = urlparse(resolved_url)
         if (parsed_proxy_url.scheme != "https" or not parsed_proxy_url.hostname
                 or parsed_proxy_url.username or parsed_proxy_url.password):
             session.close()
             raise LensProxyError("proxy_config_invalid",
                                  "Vercel proxy URL must be an HTTPS URL.")
-        adapter = _VercelProxyAdapter(proxy_url, proxy_secret)
+        adapter = _VercelProxyAdapter(resolved_url, resolved_secret)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
+    else:
+        cffi = _load_curl_cffi()
+        session = _CurlCffiSession(cffi) if cffi is not None else requests.Session()
+        effective_proxy = (local_proxy or os.getenv("GLENS_PROXY", "").strip() or None)
+        if effective_proxy:
+            session.proxies.update({"http": effective_proxy, "https": effective_proxy})
     user_agent = jar.get("user_agent") or _REQ_UA_FALLBACK
     # Google fingerprints more than cookies: a bare header set gets the JS-gate
     # shell even with a fresh jar, while the browser's full header surface gets
@@ -929,8 +1225,12 @@ def _search_via_requests(
     frame_bytes: bytes, cookie_file: Path,
     lang: str | None = None,
     proxy: str | None = None,
+    *,
+    proxy_url: str | None = None,
+    proxy_secret: str | None = None,
+    local_proxy: str | None = None,
 ) -> tuple[list[dict] | None, str | None]:
-    """Both Lens legs over plain requests, riding the browser-minted cookie jar.
+    """Both Lens legs over plain HTTP, riding the browser-minted cookie jar.
 
     Returns ``(items, results_url)``: the scraped anchor items, or ``(None, ...)``
     when the caller should fall back to the browser (no jar, upload failed, or
@@ -944,8 +1244,17 @@ def _search_via_requests(
                                  "A browser-minted Google session is required for proxy searches.")
         logger.info("glens req backend: no cookie jar yet; using the browser to mint one.")
         return None, None
-    session = (_req_session(jar, lang=lang) if proxy is None
-               else _req_session(jar, lang=lang, proxy=proxy))
+    if proxy is None and local_proxy is None:
+        session = _req_session(jar, lang=lang)
+    elif proxy is None:
+        session = _req_session(jar, lang=lang, local_proxy=local_proxy)
+    elif proxy_url is None and proxy_secret is None:
+        session = _req_session(jar, lang=lang, proxy=proxy)
+    else:
+        session = _req_session(
+            jar, lang=lang, proxy=proxy,
+            proxy_url=proxy_url, proxy_secret=proxy_secret,
+        )
     last_exc: Exception | None = None
     # Bound before the loop: the HTTPError handler reports it, and the upload
     # itself can fail before we ever learn where it would have landed.
@@ -963,12 +1272,17 @@ def _search_via_requests(
             )
             resp.raise_for_status()
             results_url = resp.url or ""
+            html = resp.text or ""
+            if _is_bot_challenge(results_url, html):
+                logger.warning("glens req backend: Google bot challenge detected (%s).",
+                               results_url[:120])
+                session.close()
+                raise LensBotChallengeError(results_url or None, reason="req_upload_challenge")
             if not _looks_like_results_url(results_url):
                 logger.info("glens req upload didn't yield a results URL (%s); falling back.",
                             results_url[:120])
                 session.close()
                 return None, None
-            html = resp.text
             items = _parse_anchors_from_html(html)
             external = [i for i in items if _is_external(i["href"])]
             # Judge the page by its CONTENT, not the enable-js marker: healthy
@@ -977,7 +1291,15 @@ def _search_via_requests(
             if len(external) < 3:
                 resp = session.get(results_url, timeout=30)
                 resp.raise_for_status()
-                html = resp.text
+                results_url = resp.url or results_url
+                html = resp.text or ""
+                if _is_bot_challenge(results_url, html):
+                    logger.warning(
+                        "glens req backend: Google bot challenge detected on GET (%s).",
+                        results_url[:120],
+                    )
+                    session.close()
+                    raise LensBotChallengeError(results_url or None, reason="req_get_challenge")
                 items = _parse_anchors_from_html(html)
                 external = [i for i in items if _is_external(i["href"])]
             if len(external) < 3:
@@ -992,10 +1314,15 @@ def _search_via_requests(
                                 "falling back.", len(external))
                 session.close()
                 return None, results_url
+            _merge_and_save_cookies(
+                cookie_file, getattr(session, "cookies", None), jar.get("user_agent")
+            )
             logger.info("glens req backend: harvested %d anchor(s) without a browser.",
                         len(items))
             session.close()
             return items, results_url
+        except LensBotChallengeError:
+            raise
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 429:
                 session.close()
@@ -1006,6 +1333,15 @@ def _search_via_requests(
                         429,
                     ) from exc
                 raise LensRateLimitError(exc.response.headers.get("Retry-After")) from exc
+            if exc.response is not None and _is_bot_challenge(
+                getattr(exc.response, "url", "") or "",
+                getattr(exc.response, "text", "") or "",
+            ):
+                session.close()
+                raise LensBotChallengeError(
+                    getattr(exc.response, "url", None),
+                    reason=f"http_{exc.response.status_code}_challenge",
+                ) from exc
             if proxy is not None:
                 session.close()
                 status_code = exc.response.status_code if exc.response is not None else None
@@ -1114,6 +1450,9 @@ def _upload_to_google(driver, frame_bytes: bytes, result_timeout: int,
             current = driver.current_url or ""
         except Exception:
             current = ""
+        if current and _is_bot_challenge(current):
+            logger.warning("glens upload: Google bot challenge detected (%s).", current[:120])
+            raise LensBotChallengeError(current, reason="browser_upload_challenge")
         if current and current != before and not current.startswith(endpoint):
             settled = current
             if _looks_like_results_url(current):
@@ -1176,6 +1515,12 @@ def _render_and_harvest(driver, results_url: str, result_timeout: int, wait_read
         wait_ready(driver)
     except Exception:
         pass
+    current_url = getattr(driver, "current_url", "") or ""
+    page_source = getattr(driver, "page_source", "") or ""
+    if _is_bot_challenge(current_url, page_source):
+        logger.warning("glens browser: Google bot challenge detected on results (%s).",
+                       current_url[:120])
+        raise LensBotChallengeError(current_url or results_url, reason="browser_render_challenge")
     _dismiss_consent(driver)
 
     def _has_products(drv):
@@ -1259,6 +1604,11 @@ def _browser_pass(frame_bytes: bytes, cookie_file: Path, result_timeout: int,
             wait_for_document_ready(driver)
         except Exception:
             pass
+        landing_url = getattr(driver, "current_url", "") or ""
+        if _is_bot_challenge(landing_url, getattr(driver, "page_source", "") or ""):
+            logger.warning("glens browser: Google bot challenge on landing page (%s).",
+                           landing_url[:120])
+            raise LensBotChallengeError(landing_url, reason="browser_landing_challenge")
         _dismiss_consent(driver)
         results_url = _upload_to_google(driver, frame_bytes, result_timeout)
         if not results_url:
@@ -1267,6 +1617,11 @@ def _browser_pass(frame_bytes: bytes, cookie_file: Path, result_timeout: int,
         if _looks_rendered(items):
             _save_cookie_jar(driver, cookie_file)
         else:
+            page = getattr(driver, "current_url", "") or ""
+            if _is_bot_challenge(page, getattr(driver, "page_source", "") or ""):
+                logger.warning("glens browser: Google bot challenge after render (%s).",
+                               page[:120])
+                raise LensBotChallengeError(page or results_url, reason="browser_degraded_sorry")
             logger.info("glens browser: page looks degraded (%d anchor(s)); "
                         "not saving the jar.", len(items or []))
         if not _to_matches(items or [], 1) and not _to_titles(items or [], 1):
@@ -1280,6 +1635,8 @@ def _browser_pass(frame_bytes: bytes, cookie_file: Path, result_timeout: int,
             ):
                 return [], results_url
         return (items or None), results_url
+    except LensBotChallengeError:
+        raise
     except ImportError as exc:
         # The [browser] extra isn't installed. This is the most common first-run
         # stumble, so surface it even when logging isn't configured. Other
@@ -1439,6 +1796,44 @@ def search(
     return result or None
 
 
+def _shape_result(
+    items: list[dict] | None,
+    results_url: str | None,
+    *,
+    max_matches: int,
+    max_titles: int,
+    resolve_links: bool = False,
+    cookie_path: Path | None = None,
+) -> LensResult | None:
+    if items is None:
+        return None
+    if items == []:
+        return LensResult(None, [], [], results_url=results_url)
+
+    if resolve_links:
+        resolve_cap = min(max_matches, DEFAULT_RESOLVE_MAX) if max_matches > 0 else 0
+        selected_hrefs = {match.url for match in _to_matches(items, resolve_cap)}
+        _resolve_google_redirects(items, cookie_path, selected_hrefs)
+
+    matches = _to_matches(items, max_matches)
+    titles = _to_titles(items, max_titles)
+    if not matches and not titles:
+        # An unrecognised page cannot establish a miss. Zero caps can also
+        # intentionally hide otherwise usable results.
+        if not ((max_matches == 0 and _to_matches(items, 1))
+                or (max_titles == 0 and _to_titles(items, 1))):
+            return None
+
+    logger.info("glens: %d title(s), %d match(es)", len(titles), len(matches))
+    return LensResult(
+        top_title=titles[0] if titles else None,
+        titles=titles,
+        matches=matches,
+        raw_anchors=items,
+        results_url=results_url,
+    )
+
+
 def _search_bytes(
     frame_bytes: bytes, *, backend: str | None = None, driver_factory: Callable | None = None,
     cookie_file: str | os.PathLike | None = None, max_matches: int | None = None,
@@ -1446,6 +1841,7 @@ def _search_bytes(
     use_cache: bool | None = None, resolve_links: bool = False,
     raise_on_rate_limit: bool = False, proxy: str | None = None,
     raise_on_proxy_error: bool = False,
+    raise_on_bot_challenge: bool = False,
 ) -> LensResult | None:
     """Return None for inconclusive lookups and an empty LensResult for confirmed misses."""
     backend_setting = backend
@@ -1474,7 +1870,8 @@ def _search_bytes(
     items: list[dict] | None = None
     results_url: str | None = None
     cache_hit = False
-    cache_key = _cache_key(frame_bytes, lang) if use_cache and proxy is None else None
+    cache_key = _cache_key(frame_bytes, lang) if use_cache else None
+    dhash: int | None = None
     if cache_key and backend != "browser":
         # An explicit browser run is also how the cookie jar gets re-minted;
         # never let a cache hit silently skip that side effect.
@@ -1482,6 +1879,18 @@ def _search_bytes(
         if cached is not None:
             items, results_url = cached
             cache_hit = True
+            _cache_mod.stats.record_l1_hit()
+        else:
+            dhash = _cache_mod.compute_dhash(frame_bytes)
+            cached_l2 = _cache_read_dhash(dhash, lang, DEFAULT_CACHE_TTL)
+            if cached_l2 is not None:
+                items, results_url = cached_l2
+                cache_hit = True
+                _cache_mod.stats.record_l2_hit()
+            else:
+                _cache_mod.stats.record_miss()
+    elif cache_key:
+        dhash = _cache_mod.compute_dhash(frame_bytes)
 
     if items is None and backend in ("auto", "req"):
         try:
@@ -1494,6 +1903,11 @@ def _search_bytes(
             if raise_on_rate_limit:
                 raise
             logger.info("glens req backend received an upstream rate limit.")
+            return None
+        except LensBotChallengeError:
+            if raise_on_bot_challenge:
+                raise
+            logger.warning("glens req backend hit a Google bot challenge; skipping browser retry.")
             return None
         except LensProxyError:
             if raise_on_proxy_error:
@@ -1508,37 +1922,31 @@ def _search_bytes(
     if items is None and backend in ("auto", "browser"):
         # Keep browser use single-filed because it may share a persistent Chrome
         # profile and refresh the cookie jar. Request-backed searches can overlap.
-        with _browser_lock:
-            items, results_url = _search_via_browser(frame_bytes, cookie_path, timeout,
-                                                     driver_factory)
+        try:
+            with _browser_lock:
+                items, results_url = _search_via_browser(frame_bytes, cookie_path, timeout,
+                                                         driver_factory)
+        except LensBotChallengeError:
+            if raise_on_bot_challenge:
+                raise
+            logger.warning("glens browser backend hit a Google bot challenge.")
+            return None
     if items is None:
         return None
     if items == []:
         return LensResult(None, [], [], results_url=results_url)
 
-    if resolve_links:
-        selected_hrefs = {match.url for match in _to_matches(items, max_matches)}
-        _resolve_google_redirects(items, cookie_path, selected_hrefs)
-    if cache_key and (not cache_hit or resolve_links):
-        _cache_write(cache_key, items, results_url)
-
-    matches = _to_matches(items, max_matches)
-    titles = _to_titles(items, max_titles)
-    if not matches and not titles:
-        # An unrecognised page cannot establish a miss. Zero caps can also
-        # intentionally hide otherwise usable results.
-        if not ((max_matches == 0 and _to_matches(items, 1))
-                or (max_titles == 0 and _to_titles(items, 1))):
-            return None
-
-    logger.info("glens: %d title(s), %d match(es)", len(titles), len(matches))
-    return LensResult(
-        top_title=titles[0] if titles else None,
-        titles=titles,
-        matches=matches,
-        raw_anchors=items,
-        results_url=results_url,
+    result = _shape_result(
+        items,
+        results_url,
+        max_matches=max_matches,
+        max_titles=max_titles,
+        resolve_links=resolve_links,
+        cookie_path=cookie_path,
     )
+    if result is not None and cache_key and (not cache_hit or resolve_links):
+        _cache_write(cache_key, items, results_url, dhash=dhash, lang=lang)
+    return result
 
 
 def search_many(
@@ -1644,8 +2052,12 @@ def warmup(
     # A junk image renders few tiles, so there's no point waiting long: any
     # rendered results page mints the cookies we're after.
     before = _jar_stamp(cookie_path)
-    with _browser_lock:
-        _search_via_browser(frame_bytes, cookie_path, timeout or 10, driver_factory)
+    try:
+        with _browser_lock:
+            _search_via_browser(frame_bytes, cookie_path, timeout or 10, driver_factory)
+    except LensBotChallengeError:
+        logger.warning("glens: warmup hit a Google bot challenge; skipping retry.")
+        return False
     after = _jar_stamp(cookie_path)
     if after is None:
         return False

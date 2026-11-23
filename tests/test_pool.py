@@ -1,0 +1,304 @@
+"""RoutePool failover, pacing, cooldowns, L2 dHash cache, single-flight, and server API."""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from io import BytesIO
+
+import pytest
+
+from glens import cache as cache_mod
+from glens import lens as lens_mod
+from glens.pool import RoutePool, RouteSlot
+
+SYNTHETIC_ITEMS = [
+    {"href": "https://a.example/p/1", "text": "Acme Widget Pro Runner"},
+    {"href": "https://b.example/p/2", "text": "Acme Widget Pro Runner"},
+    {"href": "https://c.example/p/3", "text": "Different Gadget Deluxe"},
+]
+RESULTS_URL = "https://www.google.com/search?udm=26&synthetic=1"
+
+
+def _write_jar(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "user_agent": "Chrome/149.0.0.0",
+        "cookies": [{"name": "SID", "value": "seed", "domain": ".google.com", "path": "/"}],
+        "minted_at": time.time(),
+    }), encoding="utf-8")
+    return path
+
+
+def _make_pool(tmp_path, *, proxy_fallback=True, vercel_rpm=20, local_rpm=15, clock=None):
+    base_jar = _write_jar(tmp_path / "cookies.json")
+    vercel_slot = RouteSlot(
+        slot_id="vercel-0",
+        kind="vercel",
+        priority=0,
+        cookie_file=tmp_path / "cookies-vercel-0.json",
+        proxy_url="https://proxy.example/api/lens",
+        proxy_secret="secret",
+        rpm_limit=vercel_rpm,
+        min_interval=0.0,
+    )
+    local_slot = RouteSlot(
+        slot_id="local-0",
+        kind="local",
+        priority=10,
+        cookie_file=base_jar,
+        rpm_limit=local_rpm,
+        min_interval=0.0,
+    )
+    return RoutePool(
+        [vercel_slot, local_slot],
+        base_cookie_file=base_jar,
+        proxy_fallback=proxy_fallback,
+        jitter_seconds=0.0,
+        clock=clock,
+        sleeper=lambda _: None,
+    )
+
+
+def test_route_pool_from_env_supports_multiple_vercel_and_local_proxies(monkeypatch, tmp_path):
+    monkeypatch.setenv("GLENS_VERCEL_PROXY_URLS", "https://v1.example/api, https://v2.example/api")
+    monkeypatch.setenv("GLENS_VERCEL_PROXY_SECRETS", "s1, s2")
+    monkeypatch.setenv("GLENS_LOCAL_PROXIES", "http://127.0.0.1:7901, http://127.0.0.1:7902")
+    monkeypatch.setenv("GLENS_PROXY_FALLBACK", "1")
+    monkeypatch.setenv("GLENS_VERCEL_RPM", "12")
+    monkeypatch.setenv("GLENS_LOCAL_RPM", "8")
+
+    pool = RoutePool.from_env(base_cookie_file=tmp_path / "cookies.json")
+    assert pool.proxy_fallback is True
+    assert [(s.slot_id, s.kind, s.rpm_limit) for s in pool.slots] == [
+        ("vercel-0", "vercel", 12),
+        ("vercel-1", "vercel", 12),
+        ("local-0", "local", 8),
+        ("local-1", "local", 8),
+    ]
+    assert pool.slots[0].proxy_secret == "s1"
+    assert pool.slots[1].proxy_secret == "s2"
+    assert pool.slots[2].local_proxy == "http://127.0.0.1:7901"
+    assert pool.slots[3].local_proxy == "http://127.0.0.1:7902"
+
+
+def test_vercel_bot_challenge_automatically_fails_over_to_local(monkeypatch, tmp_path):
+    pool = _make_pool(tmp_path, proxy_fallback=True)
+    seen = []
+
+    def fake_req(frame, cookie_file, lang=None, proxy=None, **kwargs):
+        seen.append((proxy, cookie_file.name))
+        if proxy == "vercel":
+            raise lens_mod.LensBotChallengeError("https://www.google.com/sorry/index")
+        return SYNTHETIC_ITEMS, RESULTS_URL
+
+    monkeypatch.setattr(lens_mod, "_search_via_requests", fake_req)
+    result, route = pool.search(b"img-1", proxy="vercel", use_cache=False)
+
+    assert result is not None and result.top_title == "Acme Widget Pro Runner"
+    assert route == "local-0"
+    assert seen == [("vercel", "cookies-vercel-0.json"), (None, "cookies.json")]
+    status = {r["slot_id"]: r for r in pool.status()["routes"]}
+    assert status["vercel-0"]["state"] == "cooldown"
+    assert status["vercel-0"]["cooldown_reason"] == "bot_challenge"
+    assert status["local-0"]["state"] == "healthy"
+    assert status["local-0"]["success_count"] == 1
+
+
+def test_vercel_rpm_cap_spills_overflow_traffic_to_local(monkeypatch, tmp_path):
+    pool = _make_pool(tmp_path, proxy_fallback=True, vercel_rpm=1, local_rpm=10)
+    monkeypatch.setattr(
+        lens_mod, "_search_via_requests",
+        lambda *a, **kw: (SYNTHETIC_ITEMS, RESULTS_URL),
+    )
+
+    _, route1 = pool.search(b"img-1", proxy="vercel", use_cache=False)
+    _, route2 = pool.search(b"img-2", proxy="vercel", use_cache=False)
+
+    assert route1 == "vercel-0"
+    assert route2 == "local-0"
+
+
+def test_strict_proxy_mode_does_not_fail_over_to_local(monkeypatch, tmp_path):
+    pool = _make_pool(tmp_path, proxy_fallback=False)
+    calls = []
+
+    def fake_req(frame, cookie_file, lang=None, proxy=None, **kwargs):
+        calls.append(proxy)
+        raise lens_mod.LensBotChallengeError("https://www.google.com/sorry/index")
+
+    monkeypatch.setattr(lens_mod, "_search_via_requests", fake_req)
+    with pytest.raises(lens_mod.LensBotChallengeError):
+        pool.search(b"img-strict", proxy="vercel", use_cache=False)
+
+    assert calls == ["vercel"]
+
+
+def test_all_slots_in_bot_challenge_cooldown_short_circuits_immediately(monkeypatch, tmp_path):
+    now = [1000.0]
+    pool = _make_pool(tmp_path, proxy_fallback=True, clock=lambda: now[0])
+    calls = []
+
+    def always_sorry(*args, **kwargs):
+        calls.append(1)
+        raise lens_mod.LensBotChallengeError("https://www.google.com/sorry/index")
+
+    monkeypatch.setattr(lens_mod, "_search_via_requests", always_sorry)
+
+    with pytest.raises(lens_mod.LensBotChallengeError):
+        pool.search(b"img-1", proxy="vercel", use_cache=False)
+    assert len(calls) == 2  # tried vercel-0 then local-0
+
+    # Next request must short-circuit without touching upstream at all.
+    with pytest.raises(lens_mod.LensBotChallengeError) as exc:
+        pool.search(b"img-2", proxy="vercel", use_cache=False)
+    assert len(calls) == 2
+    assert getattr(exc.value, "retry_after", None) is not None
+
+
+def test_proxy_search_hits_l1_and_l2_dhash_cache(monkeypatch, tmp_path):
+    PIL = pytest.importorskip("PIL")
+    from PIL import Image
+
+    assert PIL is not None
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setenv("GLENS_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("GLENS_CACHE_DHASH_THRESHOLD", "4")
+    cache_mod.stats.reset()
+
+    # Build a patterned image and a re-encoded slightly-resized copy (different SHA-256, same dHash)
+    img = Image.new("RGB", (200, 200))
+    for y in range(200):
+        for x in range(200):
+            img.putpixel((x, y), ((x * 255) // 200, (y * 255) // 200, 128))
+    buf1 = BytesIO()
+    img.save(buf1, format="PNG")
+    bytes_v1 = buf1.getvalue()
+
+    buf2 = BytesIO()
+    img.resize((180, 180)).save(buf2, format="JPEG", quality=80)
+    bytes_v2 = buf2.getvalue()
+    assert bytes_v1 != bytes_v2
+
+    pool = _make_pool(tmp_path, proxy_fallback=True)
+    upstream_calls = []
+
+    def fake_req(*args, **kwargs):
+        upstream_calls.append(1)
+        return SYNTHETIC_ITEMS, RESULTS_URL
+
+    monkeypatch.setattr(lens_mod, "_search_via_requests", fake_req)
+
+    res1, route1 = pool.search(bytes_v1, proxy="vercel", use_cache=True)
+    res2, route2 = pool.search(bytes_v1, proxy="vercel", use_cache=True)
+    res3, route3 = pool.search(bytes_v2, proxy="vercel", use_cache=True)
+
+    assert len(upstream_calls) == 1
+    assert res1 is not None and route1 == "vercel-0"
+    assert res2 is not None and route2 == "cache-l1"
+    assert res3 is not None and route3 == "cache-l2"
+    snap = cache_mod.stats.snapshot()
+    assert snap["l1_hits"] == 1
+    assert snap["l2_hits"] == 1
+
+
+def test_concurrent_identical_requests_coalesce_single_flight(monkeypatch, tmp_path):
+    pool = _make_pool(tmp_path, proxy_fallback=True)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def slow_req(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(timeout=5)
+        return SYNTHETIC_ITEMS, RESULTS_URL
+
+    monkeypatch.setattr(lens_mod, "_search_via_requests", slow_req)
+    results = []
+
+    def worker():
+        results.append(pool.search(b"same-image", proxy="vercel", use_cache=False))
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    assert entered.wait(timeout=3)
+    t2.start()
+    time.sleep(0.05)
+    release.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert len(calls) == 1
+    assert len(results) == 2
+    assert all(r is not None and r.top_title == "Acme Widget Pro Runner" for r, _ in results)
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_server_exposes_route_header_bot_challenge_503_pool_status_and_warmup(
+    monkeypatch, tmp_path,
+):
+    pytest.importorskip("fastapi")
+    import httpx
+
+    from glens import server
+
+    pool = _make_pool(tmp_path, proxy_fallback=True)
+    server.reset_pool(pool)
+    monkeypatch.setattr(server, "download_image", lambda _url: lens_mod._tiny_png())
+    monkeypatch.setattr(lens_mod, "DEFAULT_USE_CACHE", False)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.create_app()),
+            base_url="http://test",
+        ) as client:
+            # 1) Vercel hits /sorry -> automatic failover to local-0 -> HTTP 200 + X-Glens-Route
+            def vercel_sorry_local_ok(frame, cookie_file, lang=None, proxy=None, **kw):
+                if proxy == "vercel":
+                    raise lens_mod.LensBotChallengeError("https://www.google.com/sorry/index")
+                return SYNTHETIC_ITEMS, RESULTS_URL
+
+            monkeypatch.setattr(lens_mod, "_search_via_requests", vercel_sorry_local_ok)
+            ok = await client.post(
+                "/v1/search", json={"image_url": "https://img.example/a.png", "proxy": "vercel"}
+            )
+            assert ok.status_code == 200
+            assert ok.headers["x-glens-route"] == "local-0"
+
+            # 2) /v1/pool/status shows vercel-0 in cooldown and local-0 healthy
+            ps = await client.get("/v1/pool/status")
+            assert ps.status_code == 200
+            body = ps.json()
+            assert body["proxy_fallback"] is True
+            by_id = {r["slot_id"]: r for r in body["routes"]}
+            assert by_id["vercel-0"]["state"] == "cooldown"
+            assert by_id["local-0"]["state"] == "healthy"
+
+            # 3) Local also hits /sorry -> HTTP 503 upstream_bot_challenge + Retry-After
+            def all_sorry(*a, **kw):
+                raise lens_mod.LensBotChallengeError("https://www.google.com/sorry/index")
+
+            monkeypatch.setattr(lens_mod, "_search_via_requests", all_sorry)
+            blocked = await client.post(
+                "/v1/search", json={"image_url": "https://img.example/b.png", "proxy": "vercel"}
+            )
+            assert blocked.status_code == 503
+            assert blocked.json()["error"]["code"] == "upstream_bot_challenge"
+            assert "retry-after" in blocked.headers
+
+            # 4) POST /v1/warmup resets cooldowns and refreshes cookies
+            monkeypatch.setattr(lens_mod, "warmup", lambda **kw: True)
+            warmed = await client.post("/v1/warmup", json={"reset_cooldown": True, "force": False})
+            assert warmed.status_code == 200
+            assert warmed.json()["slots"]["local-0"]["state"] == "healthy"
+            assert warmed.json()["slots"]["vercel-0"]["state"] == "healthy"
+    finally:
+        server.reset_pool(None)
