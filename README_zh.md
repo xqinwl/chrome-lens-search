@@ -167,7 +167,34 @@ docker compose exec glens grep 'req_id=你的请求ID' /data/logs/glens.log
 docker compose exec glens grep -E 'WARNING|ERROR|Chromium|cooling down' /data/logs/glens.log
 ```
 
-### 7. 常见部署问题
+### 7. 打包发布镜像到 Docker Hub（按版本打 Tag）
+
+项目提供了发布脚本 `scripts/docker-release.sh`，每次发新版时自动按版本 Tag + Git SHA Tag + `latest` 跨平台打包并推送（默认构建 `linux/amd64`，适配 DigitalOcean）：
+
+```bash
+# 1) 首次登录 Docker Hub，并在 .env 中配置目标仓库名（或通过 --image 传入）
+docker login
+# 在 .env 中添加：DOCKER_IMAGE=你的用户名/chrome-lens-search
+
+# 2) 发布新版本（自动推送 :v1.0.0、:sha-<commit>、:latest）
+./scripts/docker-release.sh v1.0.0
+
+# 可选：同时构建 amd64 + arm64 双架构，并同步打 Git Tag
+./scripts/docker-release.sh v1.0.0 --platform linux/amd64,linux/arm64 --git-tag
+
+# 可选：测试版不覆盖 latest，或先 --dry-run 预览命令
+./scripts/docker-release.sh v1.0.1-rc1 --no-latest
+./scripts/docker-release.sh v1.0.0 --dry-run
+```
+
+在 DigitalOcean 上直接拉取指定版本镜像运行（无需在服务器上重新构建）：
+
+```bash
+GLENS_IMAGE=你的用户名/chrome-lens-search:v1.0.0 docker compose pull
+GLENS_IMAGE=你的用户名/chrome-lens-search:v1.0.0 docker compose up -d --no-build
+```
+
+### 8. 常见部署问题
 
 - **本机使用 Clash 时 `image_url` 返回 `422 invalid_image_url`**：Clash Fake-IP 会将公网域名解析为 `198.18.x.x`，被服务端 SSRF 安全校验拦截。**本机调试**可在 `.env` 中加 `GLENS_ALLOW_FAKE_IP=1` 后重启容器（仅放行 `198.18.0.0/15`，内网与云元数据 IP 仍严格拦截），或在 Clash `dns.fake-ip-filter` 中排除图片域名。**DigitalOcean 等公网云服务器无此问题，生产环境请保持 `GLENS_ALLOW_FAKE_IP=0`。**
 - **云服务器机房 IP 遇到 `/sorry`**：若 `POST /v1/warmup` 或 `/v1/pool/status` 显示 `local-0` 触发 `bot_challenge`，在 `.env` 中配置 `GLENS_PROXY`（或 `GLENS_LOCAL_PROXIES`）为干净代理出口，Chromium 续期与本地通道会自动走该代理。

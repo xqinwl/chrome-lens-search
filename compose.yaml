@@ -1,5 +1,6 @@
 services:
   glens:
+    image: ${GLENS_IMAGE:-chrome-lens-search-glens:latest}
     build: .
     init: true
     environment:

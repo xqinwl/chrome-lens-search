@@ -130,6 +130,24 @@ docker compose exec glens grep 'req_id=<X-Request-Id>' /data/logs/glens.log
 docker compose exec glens grep -E 'WARNING|ERROR|Chromium|cooling down' /data/logs/glens.log
 ```
 
+### 5. Building and pushing versioned images to Docker Hub
+
+Use `scripts/docker-release.sh` to build, tag (`<version>`, `sha-<commit>`, and `latest`), and push releases (defaults to `linux/amd64` for cloud VMs such as DigitalOcean):
+
+```bash
+docker login
+# Optionally set DOCKER_IMAGE=youruser/chrome-lens-search in .env
+./scripts/docker-release.sh v1.0.0 --image youruser/chrome-lens-search
+./scripts/docker-release.sh v1.0.0 --platform linux/amd64,linux/arm64 --git-tag
+```
+
+Deploy a pinned release tag on a server without rebuilding:
+
+```bash
+GLENS_IMAGE=youruser/chrome-lens-search:v1.0.0 docker compose pull
+GLENS_IMAGE=youruser/chrome-lens-search:v1.0.0 docker compose up -d --no-build
+```
+
 **Local Clash Fake-IP note:** If Docker DNS resolves image hosts to `198.18.x.x`, either exclude those domains in Clash `dns.fake-ip-filter` or set `GLENS_ALLOW_FAKE_IP=1` in your local `.env` (allows `198.18.0.0/15` only; loopback, RFC1918, and cloud metadata IPs remain blocked). Keep `GLENS_ALLOW_FAKE_IP=0` on public cloud servers.
 
 To serve directly from a checkout, install `pip install ".[server,browser]"` and run `glens serve` (default `127.0.0.1:8000`; use `--host` and `--port` to override).
