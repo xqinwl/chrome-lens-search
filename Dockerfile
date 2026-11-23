@@ -1,7 +1,7 @@
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium chromium-driver ca-certificates xvfb xauth tini \
+    && apt-get install -y --no-install-recommends chromium chromium-driver ca-certificates xvfb xauth \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 glens \
     && install -d -o glens -g glens /data /data/logs \
@@ -25,6 +25,11 @@ ENV GLENS_BACKEND=auto \
     GLENS_RESOLVE_MAX=5 \
     GLENS_CHROMIUM_PATH=/usr/bin/chromium \
     GLENS_CHROMEDRIVER_PATH=/home/glens/chromedriver
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 USER glens
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s \
