@@ -27,6 +27,7 @@ Options:
                            Use linux/amd64,linux/arm64 for multi-arch.
   --no-latest              Do not also tag and push :latest
   --no-sha                 Do not also tag and push :sha-<git-short-sha>
+  --no-readme              Do not sync DOCKERHUB.md to Docker Hub Overview
   --git-tag                Also create and push matching git tag <version-tag>
   --allow-dirty            Allow releasing with uncommitted git changes
   --dry-run                Print the build/push commands without executing
@@ -54,6 +55,7 @@ IMAGE="${DOCKER_IMAGE:-}"
 PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 PUSH_LATEST=1
 PUSH_SHA=1
+SYNC_README=1
 CREATE_GIT_TAG=0
 ALLOW_DIRTY=0
 DRY_RUN=0
@@ -78,6 +80,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-sha)
       PUSH_SHA=0
+      shift
+      ;;
+    --no-readme)
+      SYNC_README=0
       shift
       ;;
     --git-tag)
@@ -205,6 +211,13 @@ fi
 echo ""
 echo "==> Building and pushing image..."
 "${BUILD_CMD[@]}"
+
+if [[ "$SYNC_README" -eq 1 ]] && [[ -f "${REPO_ROOT}/DOCKERHUB.md" ]] && [[ -f "${SCRIPT_DIR}/sync-dockerhub-readme.py" ]]; then
+  echo ""
+  echo "==> Syncing DOCKERHUB.md to Docker Hub Overview..."
+  python3 "${SCRIPT_DIR}/sync-dockerhub-readme.py" "$IMAGE" "${REPO_ROOT}/DOCKERHUB.md" || \
+    echo "Warning: image pushed, but syncing DOCKERHUB.md failed (update manually if needed)." >&2
+fi
 
 if [[ "$CREATE_GIT_TAG" -eq 1 ]]; then
   if git rev-parse "$VERSION" >/dev/null 2>&1; then
