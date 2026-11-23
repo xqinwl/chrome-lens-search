@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -23,6 +29,7 @@ from .lens import (
     _search_bytes,
     status,
 )
+from .logging_setup import configure_logging
 from .pool import RoutePool
 from .server_images import (
     MAX_IMAGE_BYTES,
@@ -33,6 +40,9 @@ from .server_images import (
     too_large,
     validate_image,
 )
+
+logger = logging.getLogger("glens")
+_REQ_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 _pool_lock = threading.Lock()
 _route_pool: RoutePool | None = None
@@ -54,11 +64,44 @@ def reset_pool(pool: RoutePool | None = None) -> None:
 
 
 class _SearchPayload(dict):
-    """JSON-serializable dict carrying the route label for X-Glens-Route."""
+    """JSON-serializable dict carrying telemetry metadata for response headers & logs."""
 
-    def __init__(self, data: dict, route: str | None = None):
+    def __init__(
+        self,
+        data: dict,
+        route: str | None = None,
+        *,
+        raw_bytes: int = 0,
+        upload_bytes: int = 0,
+    ):
         super().__init__(data)
         self.route = route
+        self.raw_bytes = raw_bytes
+        self.upload_bytes = upload_bytes
+
+
+def _request_id(request: Request) -> str:
+    existing = getattr(request.state, "req_id", None)
+    if existing:
+        return existing
+    incoming = (request.headers.get("x-request-id") or "").strip()
+    req_id = incoming if _REQ_ID_RE.match(incoming) else uuid.uuid4().hex[:12]
+    request.state.req_id = req_id
+    return req_id
+
+
+def _safe_source_label(source: bytes | str | None) -> str:
+    if source is None:
+        return "-"
+    if isinstance(source, bytes):
+        return f"file({len(source)}B)"
+    try:
+        parts = urlsplit(source)
+        if parts.scheme and parts.hostname:
+            return f"{parts.scheme}://{parts.hostname}"
+    except ValueError:
+        pass
+    return "url(invalid)"
 
 
 class SearchOptions(BaseModel):
@@ -150,10 +193,12 @@ def _lookup(source: bytes | str, options: SearchOptions) -> dict:
         raise APIError(422, "proxy_option_unsupported",
                        "resolve_links is not supported with the Vercel proxy.")
     data = download_image(source) if isinstance(source, str) else source
+    raw_bytes = len(data)
     validate_image(data)
     data = normalize_image_for_lens(data)
     if options.proxy is not None:
         data = compress_image_for_proxy(data)
+    upload_bytes = len(data)
     route_id: str | None = None
     try:
         if _search_bytes is not _lens_mod._search_bytes:
@@ -179,26 +224,79 @@ def _lookup(source: bytes | str, options: SearchOptions) -> dict:
         {"top_title": result.top_title, "titles": result.titles,
          "matches": [asdict(match) for match in result.matches]},
         route=route_id,
+        raw_bytes=raw_bytes,
+        upload_bytes=upload_bytes,
     )
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="glens", version="1")
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        configure_logging()
+        pool = _get_pool()
+        slot_summary = ",".join(
+            f"{s.slot_id}({s.kind}:rpm={s.rpm_limit})" for s in pool.slots
+        )
+        logger.info(
+            "glens server startup: slots=[%s] proxy_fallback=%s",
+            slot_summary, pool.proxy_fallback,
+        )
+        yield
+        logger.info("glens server shutdown.")
+
+    app = FastAPI(title="glens", version="1", lifespan=_lifespan)
 
     @app.exception_handler(APIError)
     async def api_error(request: Request, exc: APIError):
+        req_id = _request_id(request)
+        headers = dict(exc.headers)
+        headers["X-Request-Id"] = req_id
+        start_t = getattr(request.state, "start_time", None)
+        duration_ms = int((time.monotonic() - start_t) * 1000) if start_t is not None else 0
+        logger.warning(
+            "http req_id=%s path=%s status=%d code=%s proxy=%s input=%s retry_after=%s "
+            "duration_ms=%d msg=%s",
+            req_id,
+            request.url.path,
+            exc.status,
+            exc.code,
+            getattr(request.state, "proxy", None) or "none",
+            getattr(request.state, "source_label", "-"),
+            headers.get("Retry-After", "-"),
+            duration_ms,
+            str(exc),
+        )
         return JSONResponse({"error": {"code": exc.code, "message": str(exc)}},
-                            status_code=exc.status, headers=exc.headers)
+                            status_code=exc.status, headers=headers)
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
+        req_id = _request_id(request)
+        headers = dict(exc.headers or {})
+        headers["X-Request-Id"] = req_id
+        logger.warning(
+            "http req_id=%s path=%s status=%d code=http_error detail=%s",
+            req_id, request.url.path, exc.status_code, exc.detail,
+        )
         return JSONResponse({"error": {"code": "http_error", "message": str(exc.detail)}},
-                            status_code=exc.status_code, headers=exc.headers)
+                            status_code=exc.status_code, headers=headers)
 
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, exc: Exception):
+        req_id = _request_id(request)
+        start_t = getattr(request.state, "start_time", None)
+        duration_ms = int((time.monotonic() - start_t) * 1000) if start_t is not None else 0
+        logger.exception(
+            "http req_id=%s path=%s status=500 code=internal_error proxy=%s input=%s "
+            "duration_ms=%d",
+            req_id,
+            request.url.path,
+            getattr(request.state, "proxy", None) or "none",
+            getattr(request.state, "source_label", "-"),
+            duration_ms,
+        )
         return JSONResponse({"error": {"code": "internal_error", "message": "Search failed."}},
-                            status_code=500)
+                            status_code=500, headers={"X-Request-Id": req_id})
 
     @app.get("/healthz")
     async def health():
@@ -215,9 +313,16 @@ def create_app() -> FastAPI:
         return _get_pool().status()
 
     @app.post("/v1/warmup")
-    async def warmup_endpoint(request: Request):
+    async def warmup_endpoint(request: Request, response: Response):
+        req_id = _request_id(request)
+        t0 = time.monotonic()
+        request.state.start_time = t0
         opts = await _read_warmup_input(request)
         pool = _get_pool()
+        logger.info(
+            "warmup req_id=%s start slot_id=%s force=%s reset_cooldown=%s",
+            req_id, opts.slot_id or "all", opts.force, opts.reset_cooldown,
+        )
         worker = asyncio.get_running_loop().run_in_executor(
             None,
             lambda: pool.warmup(
@@ -228,7 +333,14 @@ def create_app() -> FastAPI:
         )
         worker.add_done_callback(lambda future: future.exception()
                                  if not future.cancelled() else None)
-        return await asyncio.shield(worker)
+        result = await asyncio.shield(worker)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        response.headers["X-Request-Id"] = req_id
+        logger.info(
+            "warmup req_id=%s status=200 duration_ms=%d slots=%s",
+            req_id, duration_ms, result.get("slots"),
+        )
+        return result
 
     schemas = {"application/json": URLSearch, "multipart/form-data": FileSearch}
     request_body = {"required": True, "content": {
@@ -237,15 +349,35 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/search", openapi_extra={"requestBody": request_body})
     async def search_endpoint(request: Request, response: Response):
+        req_id = _request_id(request)
+        t0 = time.monotonic()
+        request.state.start_time = t0
         source, options = await _read_input(request)
+        request.state.proxy = options.proxy
+        request.state.source_label = _safe_source_label(source)
         worker = asyncio.get_running_loop().run_in_executor(None, _lookup, source, options)
         worker.add_done_callback(lambda future: future.exception()
                                  if not future.cancelled() else None)
         # Cancellation of an HTTP handler cannot stop a running browser thread.
         payload = await asyncio.shield(worker)
+        duration_ms = int((time.monotonic() - t0) * 1000)
         route = getattr(payload, "route", None)
+        response.headers["X-Request-Id"] = req_id
         if route:
             response.headers["X-Glens-Route"] = route
+        logger.info(
+            "search req_id=%s status=200 route=%s proxy=%s input=%s raw_bytes=%d "
+            "upload_bytes=%d matches=%d titles=%d duration_ms=%d",
+            req_id,
+            route or "custom",
+            options.proxy or "none",
+            request.state.source_label,
+            getattr(payload, "raw_bytes", 0),
+            getattr(payload, "upload_bytes", 0),
+            len(payload.get("matches", [])),
+            len(payload.get("titles", [])),
+            duration_ms,
+        )
         return payload
 
     return app

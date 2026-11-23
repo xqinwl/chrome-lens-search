@@ -415,6 +415,7 @@ class RoutePool:
             after_wait_stamp = lens_mod._jar_stamp(slot.cookie_file)
             if after_wait_stamp is not None and after_wait_stamp != before_stamp:
                 # Another request just refreshed this slot's cookies; ride req path.
+                logger.info("glens pool: slot %s rode freshly refreshed cookies.", slot.slot_id)
                 items, results_url = lens_mod._search_via_requests(
                     frame_bytes,
                     slot.cookie_file,
@@ -424,26 +425,44 @@ class RoutePool:
                 if items is not None:
                     return items, results_url
             if slot.last_refresh_failed_at and now - slot.last_refresh_failed_at < 30.0:
+                logger.warning(
+                    "glens pool: slot %s skipping Chromium refresh (recent failure %.1fs ago).",
+                    slot.slot_id, now - slot.last_refresh_failed_at,
+                )
                 return None, results_url
             slot.set_refreshing(True)
+            refresh_t0 = self._clock()
+            logger.info("glens pool: slot %s starting Chromium cookie refresh.", slot.slot_id)
             try:
                 driver_factory = self._make_driver_factory(slot)
                 with lens_mod._browser_lock:
                     items, results_url = lens_mod._search_via_browser(
                         frame_bytes, slot.cookie_file, timeout, driver_factory
                     )
+                refresh_dt = self._clock() - refresh_t0
                 if items is None:
                     slot.last_refresh_failed_at = self._clock()
+                    logger.warning(
+                        "glens pool: slot %s Chromium cookie refresh failed after %.2fs.",
+                        slot.slot_id, refresh_dt,
+                    )
                 else:
                     slot.last_refresh_failed_at = 0.0
                     # Sync freshly minted cookies to Vercel slots and release stale-jar cooldowns.
+                    synced = 0
                     for other in self.slots:
                         if other.kind == "vercel":
                             lens_mod._ensure_route_cookie_file(
                                 other.cookie_file, self.base_cookie_file
                             )
+                            synced += 1
                             if other.cooldown_reason == "proxy_lookup_failed":
                                 other.reset_cooldown()
+                    logger.info(
+                        "glens pool: slot %s Chromium cookie refresh succeeded in %.2fs "
+                        "(synced %d vercel slot(s)).",
+                        slot.slot_id, refresh_dt, synced,
+                    )
                 return items, results_url
             finally:
                 slot.set_refreshing(False)
@@ -593,6 +612,10 @@ class RoutePool:
                 if slot is None:
                     if not tried:
                         retry_str = str(max(1, int(math.ceil(wait_s))))
+                        logger.warning(
+                            "glens pool: all candidate routes blocked (reason=%s retry_after=%ss).",
+                            reason, retry_str,
+                        )
                         if reason == "bot_challenge":
                             err = lens_mod.LensBotChallengeError(reason="all_routes_in_cooldown")
                             err.retry_after = retry_str  # type: ignore[attr-defined]
@@ -644,6 +667,11 @@ class RoutePool:
                     slot.mark_transient_error(
                         duration=60.0, now=self._clock(), reason="proxy_lookup_failed",
                     )
+                    logger.warning(
+                        "glens pool: slot %s returned degraded/empty results; cooling down 60s "
+                        "and failing over if another route is available.",
+                        slot.slot_id,
+                    )
                     last_proxy_error = lens_mod.LensProxyError(
                         "proxy_lookup_failed",
                         "Vercel proxy did not return usable Lens results.",
@@ -651,6 +679,10 @@ class RoutePool:
                     continue
                 slot.mark_transient_error(
                     duration=15.0, now=self._clock(), reason="lookup_failed",
+                )
+                logger.warning(
+                    "glens pool: slot %s lookup returned no usable results; cooling down 15s.",
+                    slot.slot_id,
                 )
 
             if last_challenge is not None:

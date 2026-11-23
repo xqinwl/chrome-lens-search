@@ -199,11 +199,13 @@ def _cmd_serve(argv: list[str]) -> int:
     try:
         import uvicorn
 
+        from .logging_setup import configure_logging
         from .server import app
     except ImportError as exc:
         print(f'glens serve requires the [server] extra ({exc}). '
               'Install chrome-lens-search[server].', file=sys.stderr)
         return 2
+    configure_logging()
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 

@@ -4,7 +4,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends chromium chromium-driver ca-certificates xvfb xauth \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 glens \
-    && install -d -o glens -g glens /data \
+    && install -d -o glens -g glens /data /data/logs \
     && install -o glens -g glens -m 0755 /usr/bin/chromedriver /home/glens/chromedriver
 
 WORKDIR /app
@@ -17,6 +17,8 @@ ENV GLENS_BACKEND=auto \
     GLENS_CACHE=1 \
     GLENS_CACHE_DIR=/data/results \
     GLENS_CHROME_PROFILE=/data/chrome-profile \
+    GLENS_LOG_LEVEL=INFO \
+    GLENS_LOG_FILE=/data/logs/glens.log \
     GLENS_HEADLESS=0 \
     GLENS_PROXY_FALLBACK=1 \
     GLENS_MAX_IMAGE_EDGE=1024 \

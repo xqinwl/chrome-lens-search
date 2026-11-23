@@ -75,6 +75,8 @@ requests 后端支持独立搜索并发，服务端内置路由池（`RoutePool`
 
 运维接口：`GET /v1/pool/status` 查看各路由状态、剩余冷却时间、近 1 分钟请求数与缓存命中统计；`POST /v1/warmup`（可选传 `{"slot_id": null, "reset_cooldown": true, "force": true}`）可在不重启容器的情况下重置冷却并刷新会话。
 
+生产日志：服务同时向标准错误输出（`docker compose logs -f`）和持久化卷文件 `/data/logs/glens.log` 写入带 UTC 时间戳的结构化日志（默认单文件 20 MiB、保留 5 份自动轮转，可通过 `GLENS_LOG_LEVEL`、`GLENS_LOG_FILE`、`GLENS_LOG_MAX_BYTES`、`GLENS_LOG_BACKUP_COUNT` 调整）。每次请求会返回 `X-Request-Id` 响应头，日志中按 `req_id` 记录路由、耗时、结果数、错误码、熔断冷却与 Chromium 续期轨迹，且自动脱敏图片 URL 查询参数与代理密钥。
+
 从源码直接运行可使用 `pip install ".[server,browser]"` 和 `glens serve`，默认监听 `127.0.0.1:8000`，可通过 `--host` 和 `--port` 调整。
 
 若 URL 返回 `422 invalid_image_url`，请确认图片域名及每次重定向都解析到公网 IP。`502 image_download_failed` 表示图片地址无法访问或拒绝下载。冷启动后若收到 `502 lens_lookup_failed` 且 `req_ready` 为 `false`，表示尚未建立可用 Lens 会话。可运行 `docker compose exec glens glens warmup -v` 检查浏览器步骤。
