@@ -1,20 +1,20 @@
 # qinwl/chrome-lens-search
 
-> **非官方项目声明**：本项目基于 `chrome-lens-search`，非 Google 官方镜像，仅供学习与研究使用。
+> **Unofficial.** Not affiliated with, endorsed by, or sponsored by Google. "Google Lens" is a trademark of Google LLC. For research and educational use.
 
-开箱即用的 **Google Lens 以图搜商品 HTTP 服务镜像**（内置 Chromium、`curl_cffi`、虚拟显示器 `Xvfb`、路由池控频熔断、两级缓存与轮转日志）。支持 **Vercel 代理优先 + 本地通道自动分流/容灾**，实测可稳定达到 **60+ 次/分钟**。
+Ready-to-run **Google Lens visual product search HTTP API** container with bundled Chromium, `curl_cffi`, virtual display (`Xvfb`), anti-bot route pooling with automatic Vercel-to-local failover, two-level caching (SHA-256 + perceptual dHash), and rotating production logs. Benchmarked at **60+ unique image searches/min**.
 
-- **支持架构**：`linux/amd64`（直接适配 DigitalOcean / AWS / 各类 Linux x86_64 云服务器）
-- **版本 Tag 说明**：
-  - `v1.0.0` 等语义化版本号：生产环境推荐使用固定版本
-  - `sha-<commit>`：精确对应 Git 提交，便于回滚
-  - `latest`：最新稳定版
+- **Architecture**: `linux/amd64` (ready for DigitalOcean, AWS, and standard x86_64 Linux VMs)
+- **Tags**:
+  - `v1.0.0` (and other semver tags): pinned releases recommended for production
+  - `sha-<commit>`: exact Git commit snapshots for deterministic rollbacks
+  - `latest`: latest stable release
 
 ---
 
-## 1. 快速启动（推荐 Docker Compose）
+## 1. Quick Start (Docker Compose — Recommended)
 
-在服务器任意目录创建 `compose.yaml` 和 `.env`，**无需克隆源码仓库**。
+Create `compose.yaml` and `.env` in any directory on your server — **no Git clone required**.
 
 ### `compose.yaml`
 
@@ -26,25 +26,25 @@ services:
     restart: unless-stopped
     init: true
     environment:
-      # Vercel 代理（支持单个或多个逗号分隔 URL）
+      # Vercel proxy (single URL or comma-separated multi-region URLs)
       GLENS_VERCEL_PROXY_URL: ${GLENS_VERCEL_PROXY_URL:-}
       GLENS_VERCEL_PROXY_URLS: ${GLENS_VERCEL_PROXY_URLS:-}
       GLENS_VERCEL_PROXY_SECRET: ${GLENS_VERCEL_PROXY_SECRET:-}
       GLENS_VERCEL_PROXY_SECRETS: ${GLENS_VERCEL_PROXY_SECRETS:-}
-      # 路由分流与控频（默认目标 60+ req/min）
+      # Routing, failover, and rate limits (tuned for 60+ req/min)
       GLENS_PROXY_FALLBACK: ${GLENS_PROXY_FALLBACK:-1}
       GLENS_VERCEL_RPM: ${GLENS_VERCEL_RPM:-50}
       GLENS_LOCAL_RPM: ${GLENS_LOCAL_RPM:-30}
       GLENS_SLOT_MIN_INTERVAL: ${GLENS_SLOT_MIN_INTERVAL:-0.3}
-      # 可选：本地通道与 Chromium 续期的出口代理（机房 IP 遇验证码时使用）
+      # Optional outbound proxy for local channel & Chromium cookie refreshes
       GLENS_PROXY: ${GLENS_PROXY:-}
       GLENS_LOCAL_PROXIES: ${GLENS_LOCAL_PROXIES:-}
-      # 缓存与图片归一化
+      # Caching & image normalization
       GLENS_CACHE: ${GLENS_CACHE:-1}
       GLENS_CACHE_DHASH_THRESHOLD: ${GLENS_CACHE_DHASH_THRESHOLD:-4}
       GLENS_MAX_IMAGE_EDGE: ${GLENS_MAX_IMAGE_EDGE:-1024}
       GLENS_RESOLVE_MAX: ${GLENS_RESOLVE_MAX:-5}
-      # 生产日志（持久化在 /data/logs/glens.log，自动轮转）
+      # Rotating production logs (persisted in /data/logs/glens.log)
       GLENS_LOG_LEVEL: ${GLENS_LOG_LEVEL:-INFO}
       GLENS_LOG_FILE: ${GLENS_LOG_FILE:-/data/logs/glens.log}
       GLENS_LOG_MAX_BYTES: ${GLENS_LOG_MAX_BYTES:-20971520}
@@ -65,27 +65,27 @@ GLENS_VERCEL_PROXY_URL=https://your-vercel-app.vercel.app/api/lens
 GLENS_VERCEL_PROXY_SECRET=your-secret
 ```
 
-### 启动与预热
+### Pull, Start, and Warm Up
 
 ```bash
 docker compose pull
 docker compose up -d
 
-# 检查健康状态
+# Liveness check
 curl http://127.0.0.1:8000/healthz
 
-# 预热会话（启动 Chromium 签发 Cookie 并同步到 Vercel 槽位）
+# Prewarm session (launches Chromium once to mint cookies and sync them to Vercel slots)
 curl -X POST http://127.0.0.1:8000/v1/warmup
 
-# 查看路由池状态
+# Inspect route pool health and cache stats
 curl http://127.0.0.1:8000/v1/pool/status
 ```
 
-> **云服务器规格建议**：建议至少 **2 GB 内存**（或 1 GB 内存 + 2 GB Swap），确保 Chromium 自动续期不会 OOM。
+> **Sizing tip:** At least **2 GB RAM** (or 1 GB RAM + 2 GB swap) is recommended on cloud VMs so Chromium cookie refreshes never hit OOM.
 
 ---
 
-## 2. 单行 `docker run` 启动
+## 2. One-Line `docker run`
 
 ```bash
 docker run -d --name glens --init --restart unless-stopped \
@@ -101,11 +101,11 @@ docker run -d --name glens --init --restart unless-stopped \
 
 ---
 
-## 3. HTTP API 调用方式
+## 3. HTTP API Usage
 
-### 方式 A：Vercel 优先 + 本地自动分流/容灾（推荐）
+### Option A: Vercel-First with Automatic Local Failover (Recommended)
 
-使用 JSON 提交公网 `image_url`，并带上 `"proxy": "vercel"`：
+Send JSON with a public `image_url` and `"proxy": "vercel"`:
 
 ```bash
 curl -i -X POST http://127.0.0.1:8000/v1/search \
@@ -118,80 +118,80 @@ curl -i -X POST http://127.0.0.1:8000/v1/search \
   }'
 ```
 
-### 方式 B：本地通道上传图片文件
+### Option B: Local Channel File Upload
 
 ```bash
 curl -i -X POST http://127.0.0.1:8000/v1/search \
   -F 'image=@shoe.jpg' \
   -F 'max_matches=5' \
-  -F 'lang=zh-CN'
+  -F 'lang=en'
 ```
 
-> **说明**：
-> - 请求体带上 `"proxy": "vercel"` 才会走 **Vercel 优先 + 本地容灾/分流**；不带 `proxy` 时仅走本地通道。
-> - `proxy: "vercel"` 仅支持 `image_url`，不支持 `resolve_links: true`。
-> - 单图大小上限 10 MiB，默认按长边 `1024px` 自动归一化压缩上传。
+> **Notes:**
+> - Include `"proxy": "vercel"` on requests that should use **Vercel-first routing with automatic failover / load-sharing to local slots** (`GLENS_PROXY_FALLBACK=1`). Omitting `proxy` routes strictly to local slots.
+> - `proxy: "vercel"` requires `image_url` and does not support `resolve_links: true`.
+> - Maximum image size is 10 MiB; oversized images are automatically resized (`GLENS_MAX_IMAGE_EDGE=1024`) to compact JPEG before upload.
 
-### 全部接口列表
+### Endpoints
 
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/healthz` | `GET` | 存活检查，返回 `{"ok": true}` |
-| `/v1/status` | `GET` | 会话基础状态（`req_ready`、`jar_age_seconds` 等） |
-| `/v1/pool/status` | `GET` | 路由池实时状态、冷却原因与剩余时间、近 1 分钟 RPM、L1/L2 缓存统计 |
-| `/v1/warmup` | `POST` | 重置冷却并刷新会话 Cookie（可选 JSON：`{"slot_id": null, "reset_cooldown": true, "force": true}`） |
-| `/v1/search` | `POST` | 执行以图搜商品，返回 `top_title`、`titles`、`matches` |
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/healthz` | `GET` | Liveness probe (`{"ok": true}`) |
+| `/v1/status` | `GET` | Basic session status (`default_backend`, `cache_enabled`, `req_ready`, `jar_age_seconds`) |
+| `/v1/pool/status` | `GET` | Live route pool telemetry: slot health, cooldown reason/remaining seconds, rolling 60s RPM, counters, and L1/L2 cache stats |
+| `/v1/warmup` | `POST` | Reset cooldowns and mint fresh session cookies on demand (optional JSON: `{"slot_id": null, "reset_cooldown": true, "force": true}`) |
+| `/v1/search` | `POST` | Visual product search returning `top_title`, `titles`, and `matches` |
 
-### 响应头与常见状态码
+### Response Headers & Error Codes
 
-- **`X-Request-Id`**：单次请求追踪 ID（支持客户端自定义透传），与日志中 `req_id=` 对应。
-- **`X-Glens-Route`**：实际命中的路由或缓存层（`cache-l1`、`cache-l2`、`vercel-0`、`local-0`）。
-- **`422 invalid_image_url`**：图片 URL 或重定向未解析为公网 IP（SSRF 防护）。
-- **`429 upstream_rate_limited`**：触发限流或所有槽位到达 RPM 上限（附带 `Retry-After`）。
-- **`503 upstream_bot_challenge`**：所有出口触发 Google `/sorry` 验证码并进入冷却（附带 `Retry-After`）。
-
----
-
-## 4. 关键环境变量
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `GLENS_VERCEL_PROXY_URL` / `GLENS_VERCEL_PROXY_URLS` | *(空)* | 单个或多个逗号分隔的 Vercel 代理 HTTPS 地址 |
-| `GLENS_VERCEL_PROXY_SECRET` / `GLENS_VERCEL_PROXY_SECRETS` | *(空)* | Vercel 代理密钥（与 Vercel 侧 `CRON_SECRET` 一致） |
-| `GLENS_PROXY_FALLBACK` | `1` | Vercel 限流/异常/冷却时自动降级分流到本地通道 |
-| `GLENS_VERCEL_RPM` | `50` (Compose) / `20` (镜像默认) | 单个 Vercel 槽位每分钟请求上限（`0` 不限） |
-| `GLENS_LOCAL_RPM` | `30` (Compose) / `15` (镜像默认) | 单个本地槽位每分钟请求上限（`0` 不限） |
-| `GLENS_SLOT_MIN_INTERVAL` | `0.3` (Compose) / `0.5` (镜像默认) | 单槽位请求最小间隔（秒） |
-| `GLENS_PROXY` / `GLENS_LOCAL_PROXIES` | *(空)* | 本地通道与 Chromium 续期出口代理（云机房 IP 遇验证码时配置） |
-| `GLENS_CACHE` | `1` | 开启两级本地缓存（L1 SHA-256 + L2 dHash 近似去重） |
-| `GLENS_CACHE_DHASH_THRESHOLD` | `4` | L2 近似图感知哈希汉明距离阈值（`0` 关闭 L2） |
-| `GLENS_MAX_IMAGE_EDGE` | `1024` | 上传图片最大长边像素（`0` 关闭缩放） |
-| `GLENS_LOG_LEVEL` | `INFO` | 日志级别（`DEBUG` / `INFO` / `WARNING` / `ERROR`） |
-| `GLENS_LOG_FILE` | `/data/logs/glens.log` | 持久化轮转日志路径（默认 20 MiB × 5 份） |
+- **`X-Request-Id`**: per-request trace ID (echoes a safe client-provided `X-Request-Id`), matching `req_id=` in server logs.
+- **`X-Glens-Route`**: winning cache tier or upstream route (`cache-l1`, `cache-l2`, `vercel-0`, `local-0`).
+- **`422 invalid_image_url`**: image URL or redirect did not resolve to a public IP (SSRF protection).
+- **`429 upstream_rate_limited`**: Google Lens rate limit or all route slots reached RPM caps (includes `Retry-After`).
+- **`503 upstream_bot_challenge`**: all available routes hit Google `/sorry` challenges and are cooling down (includes `Retry-After`).
 
 ---
 
-## 5. 生产日志与排错复盘
+## 4. Key Environment Variables
 
-日志同时输出到标准输出与持久卷 `/data/logs/glens.log`（容器重建后日志保留，自动脱敏 URL 查询参数与密钥）：
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GLENS_VERCEL_PROXY_URL` / `GLENS_VERCEL_PROXY_URLS` | *(empty)* | Single or comma-separated Vercel proxy HTTPS URLs |
+| `GLENS_VERCEL_PROXY_SECRET` / `GLENS_VERCEL_PROXY_SECRETS` | *(empty)* | Shared secret(s) matching Vercel `CRON_SECRET` |
+| `GLENS_PROXY_FALLBACK` | `1` | Automatically fail over / load-share from Vercel to local slots |
+| `GLENS_VERCEL_RPM` | `50` (Compose) / `20` (image) | Per-slot RPM limit for Vercel slots (`0` = unlimited) |
+| `GLENS_LOCAL_RPM` | `30` (Compose) / `15` (image) | Per-slot RPM limit for local slots (`0` = unlimited) |
+| `GLENS_SLOT_MIN_INTERVAL` | `0.3` (Compose) / `0.5` (image) | Minimum spacing between requests per slot (seconds) |
+| `GLENS_PROXY` / `GLENS_LOCAL_PROXIES` | *(empty)* | Outbound proxy URL(s) for local HTTP & Chromium refreshes (helpful if datacenter IP hits `/sorry`) |
+| `GLENS_CACHE` | `1` | Enable two-level local cache (L1 SHA-256 + L2 dHash near-duplicate) |
+| `GLENS_CACHE_DHASH_THRESHOLD` | `4` | L2 64-bit dHash Hamming distance threshold (`0` disables L2) |
+| `GLENS_MAX_IMAGE_EDGE` | `1024` | Max image edge in pixels before JPEG normalization (`0` disables) |
+| `GLENS_LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `GLENS_LOG_FILE` | `/data/logs/glens.log` | Persistent rotating log file (20 MiB × 5 backups by default) |
+
+---
+
+## 5. Production Logs & Troubleshooting
+
+Structured UTC millisecond-timestamped logs are written to both stderr and the persistent `/data/logs/glens.log` volume (URL query strings and secrets are stripped automatically):
 
 ```bash
-# 实时日志
+# Live logs
 docker compose logs -f glens
 
-# 查看持久日志
+# Inspect persistent log file (survives container recreates)
 docker compose exec glens tail -n 200 /data/logs/glens.log
 
-# 按响应头里的 X-Request-Id 追踪单次请求
-docker compose exec glens grep 'req_id=你的ID' /data/logs/glens.log
+# Trace a single request using X-Request-Id
+docker compose exec glens grep 'req_id=<X-Request-Id>' /data/logs/glens.log
 
-# 只看告警、报错、熔断冷却与 Chromium 续期
+# Filter warnings, errors, cooldowns, and Chromium cookie refreshes
 docker compose exec glens grep -E 'WARNING|ERROR|Chromium|cooling down' /data/logs/glens.log
 ```
 
-## 6. 升级到新版本
+## 6. Upgrading
 
 ```bash
-# 修改 compose.yaml 中的 tag（或使用 latest）后执行：
+# Update the tag in compose.yaml (or track :latest), then:
 docker compose pull && docker compose up -d
 ```
